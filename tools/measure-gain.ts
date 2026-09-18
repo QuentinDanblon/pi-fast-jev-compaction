@@ -2,13 +2,16 @@
  * Measures what this extension actually saves, on one real pi session.
  *
  * It rebuilds the session's compaction-aware context (exactly what pi sends to the model),
- * replays it chunk by chunk the way a live session grows — same pruner instance, so cached
- * decisions accumulate — and reports the context size before and after.
+ * replays it chunk by chunk as a live session grows — same pruner instance, so cached decisions
+ * accumulate — and reports the context size before and after.
+ *
+ * For a faithful simulation of the gates (size trigger, cache-cost gap, urgent bypass) and of the
+ * cache penalty, use `tools/simulate-session.ts` instead: this one is the quick before/after view.
  *
  * Prints aggregate numbers only: message counts, byte sizes, token estimates and Jev usage.
  * Never message content.
  *
- *   node --import jiti/register tools/measure-gain.ts ~/.pi/agent/sessions/<dir>/<file>.jsonl [chunk]
+ *   node --import jiti/register tools/measure-gain.ts <session.jsonl> [chunkSize]
  *
  * Needs a Jev key (see README) and dev dependencies installed (`npm install`).
  */
@@ -17,69 +20,14 @@ import { readFileSync } from "node:fs";
 import { basename } from "node:path";
 import { buildSessionContext, parseSessionEntries } from "@earendil-works/pi-coding-agent";
 import { HttpJevAsker, JevPruner, loadConfig, resolveApiKey, type PiMessage } from "../index.ts";
+import { measurePayload } from "./token-model.ts";
 
-/** Rough cost of one image content block, whatever its base64 length. */
-const IMAGE_TOKENS = 1200;
-/** Serialised text-ish payload per token; validated to ~10% against pi's own usage numbers. */
-const CHARS_PER_TOKEN = 3.5;
-
-interface Measure {
-	textChars: number;
-	thinkingChars: number;
-	argumentChars: number;
-	detailsChars: number;
-	images: number;
-	imageChars: number;
-	tokens: number;
-}
-
-function measure(messages: readonly PiMessage[]): Measure {
-	let textChars = 0;
-	let thinkingChars = 0;
-	let argumentChars = 0;
-	let detailsChars = 0;
-	let images = 0;
-	let imageChars = 0;
-	for (const message of messages) {
-		const record = message as { content?: unknown; details?: unknown; output?: string; command?: string };
-		const content = record.content;
-		if (typeof content === "string") textChars += content.length;
-		else if (Array.isArray(content)) {
-			for (const part of content as { type?: string; text?: string; thinking?: string; data?: string; arguments?: unknown }[]) {
-				if (part.type === "text") textChars += part.text?.length ?? 0;
-				else if (part.type === "thinking") thinkingChars += part.thinking?.length ?? 0;
-				else if (part.type === "image") {
-					images += 1;
-					imageChars += part.data?.length ?? 0;
-				} else if (part.type === "toolCall") argumentChars += JSON.stringify(part.arguments ?? {}).length;
-			}
-		}
-		if (record.details !== undefined) detailsChars += JSON.stringify(record.details).length;
-		if (typeof record.output === "string") textChars += record.output.length;
-		if (typeof record.command === "string") textChars += record.command.length;
-	}
-	const payload = textChars + thinkingChars + argumentChars + detailsChars;
-	return {
-		textChars,
-		thinkingChars,
-		argumentChars,
-		detailsChars,
-		images,
-		imageChars,
-		tokens: payload / CHARS_PER_TOKEN + images * IMAGE_TOKENS,
-	};
-}
-
-function realContextTokens(messages: readonly PiMessage[]): number | undefined {
-	for (let index = messages.length - 1; index >= 0; index -= 1) {
-		const message = messages[index] as {
-			role?: string;
-			usage?: { input?: number; cacheRead?: number; cacheWrite?: number };
-		};
-		if (message.role !== "assistant" || !message.usage) continue;
-		return (message.usage.input ?? 0) + (message.usage.cacheRead ?? 0) + (message.usage.cacheWrite ?? 0);
-	}
-	return undefined;
+/** Real prompt tokens of the LLM call that produced this assistant message, when pi recorded it. */
+function realPromptTokens(message: PiMessage): number | undefined {
+	const usage = (message as { usage?: { input?: number; cacheRead?: number; cacheWrite?: number } }).usage;
+	if (!usage) return undefined;
+	const prompt = (usage.input ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
+	return prompt > 0 ? prompt : undefined;
 }
 
 const file = process.argv[2];
@@ -90,26 +38,27 @@ if (!file) {
 const chunkSize = Number(process.argv[3] ?? 80);
 
 const entries = parseSessionEntries(readFileSync(file, "utf8"));
-const context = buildSessionContext(entries as never[]) as unknown as { messages: Record<string, unknown>[] };
-const full = (context.messages ?? []) as unknown as PiMessage[];
+const context = buildSessionContext(entries as never[]) as unknown as { messages: PiMessage[] };
+const full = context.messages ?? [];
 if (full.length === 0) {
 	console.error("this session has no messages on its active branch");
 	process.exit(1);
 }
 
-const before = measure(full);
-const real = realContextTokens(full);
+const before = measurePayload(full);
+const lastAssistant = [...full].reverse().find((message) => message.role === "assistant");
+const real = lastAssistant ? realPromptTokens(lastAssistant) : undefined;
 const kb = (chars: number) => `${(chars / 1024).toFixed(0)} KB`;
 
 console.log(`${basename(file)} — ${full.length} messages`);
 console.log(
-	`  payload      : ${kb(before.textChars + before.thinkingChars + before.argumentChars + before.detailsChars)}` +
-		` (text ${kb(before.textChars)}, thinking ${kb(before.thinkingChars)}, call args ${kb(before.argumentChars)}, details ${kb(before.detailsChars)})` +
-		` + ${before.images} image(s) ${kb(before.imageChars)}`,
+	`  payload      : ${kb(before.payloadChars)} (text ${kb(before.textChars)}, thinking ${kb(before.thinkingChars)}, ` +
+		`call args ${kb(before.argumentChars)}, details ${kb(before.detailsChars)}) + ${before.images} image(s) ` +
+		`${kb(before.imageChars)} = ${before.imageTokens} tok${before.imagesUnknown > 0 ? ` (${before.imagesUnknown} unreadable)` : ""}`,
 );
 console.log(
 	`  before       : ~${(before.tokens / 1000).toFixed(0)}k tokens` +
-		(real ? `  (pi reported ${(real / 1000).toFixed(0)}k for this context)` : ""),
+		(real ? `  (pi reported ${(real / 1000).toFixed(0)}k for the last call)` : ""),
 );
 
 const config = loadConfig();
@@ -130,31 +79,35 @@ const pruner = new JevPruner(
 		maxRequestTokens: config.maxRequestTokens ?? 30_000,
 		fallbackWindowMessages: config.fallbackWindowMessages ?? 120,
 		requestConcurrency: config.requestConcurrency ?? 4,
+		stateResultHeadChars: config.stateResultHeadChars ?? 300,
+		abridgeArgumentChars: config.abridgeArgumentChars ?? 500,
 	},
 );
 
 let requests = 0;
 let outgoing: readonly PiMessage[] = full;
+let lastStats: { callsDropped: number; resultsDropped: number; downgraded: number; abridgedArgs: number; kept: number } | undefined;
 const steps = Math.ceil(full.length / chunkSize);
 for (let step = 0; step < steps; step += 1) {
 	const slice = full.slice(-Math.min((step + 1) * chunkSize, full.length));
 	const outcome = await pruner.prune(slice, { allowNetwork: true });
 	requests += outcome?.stats.requests ?? 0;
+	if (outcome) lastStats = outcome.stats;
 	outgoing = outcome ? outcome.messages : slice;
 }
-const after = measure(outgoing);
-const payloadBefore = before.textChars + before.thinkingChars + before.argumentChars + before.detailsChars;
-const payloadAfter = after.textChars + after.thinkingChars + after.argumentChars + after.detailsChars;
+const after = measurePayload(outgoing);
+const net = before.tokens - after.tokens;
 
 console.log(`  after        : ~${(after.tokens / 1000).toFixed(0)}k tokens, ${outgoing.length} messages`);
 console.log(
-	`  saved        : ${(((before.tokens - after.tokens) / before.tokens) * 100).toFixed(1)}% tokens, ` +
-		`${(((payloadBefore - payloadAfter) / payloadBefore) * 100).toFixed(1)}% payload` +
-		` (text ${kb(before.textChars)} -> ${kb(after.textChars)}, args ${kb(before.argumentChars)} -> ${kb(after.argumentChars)}, ` +
+	`  saved        : ${((net / before.tokens) * 100).toFixed(1)}% of the payload (` +
+		`text ${kb(before.textChars)} -> ${kb(after.textChars)}, args ${kb(before.argumentChars)} -> ${kb(after.argumentChars)}, ` +
 		`details ${kb(before.detailsChars)} -> ${kb(after.detailsChars)}, images ${before.images} -> ${after.images})`,
 );
-console.log(`  cost         : ${requests} Jev request(s), ${pruner.cacheSize} calls scored, ${pruner.failures} failure(s)`);
 console.log(
-	"  note         : permissive gates (minNewCalls 1, minPendingChars 0) — this is the upper bound;",
+	`  decisions    : ${lastStats?.callsDropped ?? 0} calls dropped, ${lastStats?.resultsDropped ?? 0} results truncated, ` +
+		`${lastStats?.downgraded ?? 0} kept for safety, ${lastStats?.abridgedArgs ?? 0} arguments abridged`,
 );
-console.log("                 token counts are estimates, the ratios compare the same basis.");
+console.log(`  cost         : ${requests} Jev request(s), ${pruner.cacheSize} calls scored, ${pruner.failures} failure(s)`);
+console.log("  note         : permissive gates (minNewCalls 1, minPendingChars 0) — an upper bound on pruning,");
+console.log("                 and no cache-invalidation penalty; use tools/simulate-session.ts for the net.");

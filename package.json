@@ -27,7 +27,7 @@
 	},
 	"scripts": {
 		"typecheck": "tsc -p tsconfig.json",
-		"test": "node --import jiti/register --test test/pruner.test.ts test/config.test.ts",
+		"test": "node --import jiti/register --test test/*.test.ts",
 		"check": "npm run typecheck && npm test",
 		"vendor": "node scripts/vendor.mjs"
 	},

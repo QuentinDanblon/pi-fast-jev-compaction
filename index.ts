@@ -31,6 +31,7 @@ import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { imageNote } from "./image.ts";
 import {
 	buildJevRequest,
 	collectToolCalls,
@@ -345,7 +346,7 @@ function asParts(content: unknown): Part[] {
 function partText(part: Part): string {
 	if (part.type === "text" && typeof part.text === "string") return part.text;
 	if (part.type === "thinking" && typeof part.thinking === "string") return part.thinking;
-	if (part.type === "image") return `[image: ${String(part.mimeType ?? "unknown")}]`;
+	if (part.type === "image") return imageNote(typeof part.data === "string" ? part.data : "", String(part.mimeType ?? "unknown"));
 	return "";
 }
 
@@ -1003,7 +1004,9 @@ export function applyDecisions(
 	abridgeArgumentChars: number,
 ): { messages: PiMessage[]; abridgedArgs: number } | null {
 	const actionOf = new Map<string, CallDecision["action"]>();
+	const downgraded = new Set<string>();
 	for (const decision of decisions) {
+		if (decision.downgraded !== undefined) downgraded.add(decision.toolUseId);
 		if (decision.action === "keep") continue;
 		actionOf.set(decision.toolUseId, decision.action);
 	}
@@ -1039,9 +1042,14 @@ export function applyDecisions(
 		const locked = parts.some((part) => part.type === "thinking");
 		const kept = parts.flatMap((part) => {
 			if (part.type !== "toolCall") return [part];
-			const action = actionOf.get(String(part.id ?? ""));
+			const id = String(part.id ?? "");
+			const action = actionOf.get(id);
 			if (action === "drop_call") return [];
-			if (action !== "drop_result" || locked || abridgeArgumentChars <= 0) return [part];
+			// Abridge the input of a call Jev wanted deleted but the safety rules kept (a
+			// mutating tool): Jev already judged the input unnecessary, and the call plus its
+			// shape stay, so the model does not lose the record of what it ran. A call Jev
+			// asked to keep is left alone — its input is exactly what it said still matters.
+			if (!downgraded.has(id) || locked || abridgeArgumentChars <= 0) return [part];
 			const [abridged, changed] = abridgeArguments(part, abridgeArgumentChars);
 			if (!changed) return [part];
 			abridgedArgs += 1;
@@ -1269,9 +1277,10 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
 				}
 				return;
 			}
-			const minCallsBetweenPrunes =
+			const floorGap =
 				state.config.minCallsBetweenPrunes ?? DEFAULT_MIN_CALLS_BETWEEN_PRUNES;
 			const pruner = state.pruner;
+			const economicGap = pruner?.requiredCallsBetweenPrunes ?? floorGap;
 			ctx.ui.notify(
 				[
 					`fast-jev-compaction: ${state.config.enabled ? "enabled" : "disabled"}`,
@@ -1280,7 +1289,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
 					`may be dropped outright: ${(state.config.readOnlyTools ?? DEFAULT_READ_ONLY_TOOLS).join(", ") || "(nothing)"}; other tools keep their call`,
 					`result head shown to Jev: ${state.config.stateResultHeadChars} chars`,
 					`min new calls/requests: ${state.config.minNewCalls}/${state.config.minIntervalMs}ms`,
-					`calls between prunes: ${minCallsBetweenPrunes} required (${Number.isFinite(state.callsSincePrune) ? state.callsSincePrune : "-"} since the last one; last prune freed ${((pruner?.freedFraction ?? 0) * 100).toFixed(1)}%)`,
+					`calls between prunes: economic ${economicGap}, floor ${floorGap} (${Number.isFinite(state.callsSincePrune) ? state.callsSincePrune : "-"} since the last one; last prune freed ${((pruner?.freedFraction ?? 0) * 100).toFixed(1)}%)`,
 					`cached decisions: ${pruner?.cacheSize ?? 0}, requests this session: ${pruner?.requests ?? 0}${pruner?.failures ? `, ${pruner.failures} failed` : ""}${pruner?.windowedRuns ? `, ${pruner.windowedRuns} windowed` : ""}`,
 					...(pruner?.lastError ? [`last error: ${pruner.lastError}`] : []),
 					state.lastStatus ?? "last prune: none",

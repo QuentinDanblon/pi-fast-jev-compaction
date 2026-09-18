@@ -14,5 +14,5 @@
 			"@earendil-works/pi-coding-agent": ["./node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"]
 		}
 	},
-	"include": ["index.ts", "test/**/*.ts", "tools/**/*.ts"]
+	"include": ["*.ts", "test/**/*.ts", "tools/**/*.ts"]
 }
