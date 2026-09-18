@@ -12,7 +12,7 @@ import type {
 	JevResponse,
 	JevState,
 } from "../vendor/fast-jev-compaction/dist/index.js";
-import { JevPruner, isReadOnlyCommand, toJevMessages, type PiMessage, type PruneOptions, type PruneOutcome } from "../index.ts";
+import { JevPruner, cacheAlreadyCold, isReadOnlyCommand, toJevMessages, type PiMessage, type PruneOptions, type PruneOutcome } from "../index.ts";
 
 type AnyMessage = PiMessage;
 
@@ -387,7 +387,8 @@ test("a read-only shell command is dropped whole, a mutating one is not", async 
 	assert.equal(disabled.decisions[0].action, "drop_result", "the heuristic can be turned off");
 });
 
-test("a mutating tool keeps its call: only the result is truncated", async () => {	const asker = new FakeAsker({ call_t1: 0, result_t1: 0 });
+test("a mutating tool keeps its call: only the result is truncated", async () => {
+	const asker = new FakeAsker({ call_t1: 0, result_t1: 0 });
 	const messages: AnyMessage[] = [
 		{ role: "user", content: "run the migration" },
 		{ role: "assistant", content: [{ type: "toolCall", id: "c1", name: "bash", arguments: { command: "pnpm db:migrate" } }] },
@@ -457,4 +458,44 @@ test("Jev is shown the head of each result it is judging", async () => {
 	const recordingOff: JevAsker = { ask: async (state, questions) => { off.push(JSON.stringify(questions)); return asker.ask(state, questions); } };
 	await new JevPruner(recordingOff, { preserveRecentMessages: 2, minNewCalls: 1, minIntervalMs: 0, minPendingChars: 0, stateResultHeadChars: 0 }).prune(messages);
 	assert.doesNotMatch(off[0], /Its output begins/);
+});
+
+test("the cache gate tunes itself from the share a prune actually frees", async () => {
+	const fresh = pruner(new FakeAsker({}));
+	assert.equal(fresh.requiredCallsBetweenPrunes, 60, "nothing measured yet: assume 15% freed");
+
+	// A prune that frees almost nothing must buy a long gap before the next one.
+	// Here the prompt is dominated by unmovable text: the only movable mass is one result.
+	const thin = pruner(new FakeAsker({ result_t1: 0 }));
+	const small = await thin.prune([
+		{ role: "user", content: "x".repeat(20_000) },
+		{ role: "assistant", content: [{ type: "toolCall", id: "c1", name: "read", arguments: {} }] },
+		{ role: "toolResult", toolCallId: "c1", toolName: "read", content: [{ type: "text", text: "y".repeat(1000) }], isError: false },
+		{ role: "user", content: "next" },
+		{ role: "assistant", content: [{ type: "text", text: "ok" }] },
+	]);
+	assert.ok(small, "the small result is still truncated");
+	assert.ok(thin.freedFraction < 0.05, `freed ${thin.freedFraction}`);
+	assert.ok(
+		thin.requiredCallsBetweenPrunes >= 180,
+		`expected a long gap, got ${thin.requiredCallsBetweenPrunes}`,
+	);
+
+	// A prune that frees half the prompt may repeat as soon as the floor allows.
+	const fat = pruner(new FakeAsker({ "*": 0 }));
+	const big = await fat.prune(transcript());
+	assert.ok(big);
+	assert.ok(fat.freedFraction > 0.4, `freed ${fat.freedFraction}`);
+	assert.ok(fat.requiredCallsBetweenPrunes <= 25, `expected a short gap, got ${fat.requiredCallsBetweenPrunes}`);
+});
+
+test("a request whose prompt was already uncached is a free moment to prune", () => {
+	const withUsage = (usage: Record<string, number>): PiMessage[] => [
+		{ role: "assistant", content: [{ type: "text", text: "hi" }], usage } as unknown as PiMessage,
+	];
+	assert.equal(cacheAlreadyCold(withUsage({ input: 500, cacheRead: 100, cacheWrite: 0 })), true);
+	assert.equal(cacheAlreadyCold(withUsage({ input: 10, cacheRead: 990, cacheWrite: 0 })), false);
+	assert.equal(cacheAlreadyCold(withUsage({ input: 0, cacheRead: 0, cacheWrite: 0 })), false);
+	assert.equal(cacheAlreadyCold([{ role: "assistant", content: [{ type: "text", text: "no usage" }] }]), false);
+	assert.equal(cacheAlreadyCold([]), false);
 });

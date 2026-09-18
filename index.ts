@@ -158,24 +158,25 @@ export const DEFAULT_READ_ONLY_TOOLS = ["read", "grep", "find", "ls", "glob"];
 const DEFAULT_TRIGGER_FRACTION = 0.5;
 
 /**
- * Fewest LLM calls between two pruning events — the cache-cost gate.
+ * Fewest LLM calls between two pruning events — the floor of the cache-cost gate.
  *
  * Removing an old call rewrites the prompt prefix, so the whole cached suffix becomes a
- * cache **write** instead of a cheap **read** (roughly 10x the price on Anthropic and
- * DeepSeek pricing, so 9 extra read-equivalents per rewritten token). A prune that frees a
- * fraction `f` of the prompt only pays for itself after
+ * cache **write** instead of a cheap **read**. The break-even is
  *
  *     (write/read - 1) / f   further LLM calls
  *
- * With the default safe rules `f` is measured around 0.11 (results only, calls kept), which
- * puts the break-even near 80 calls. With whole calls deletable (`f` ~ 0.3) it drops to ~30.
- * Fewer, larger prunes beat continuous trimming; the 85 % "urgent" path bypasses this when
- * the window really fills, because a full window is worse than an invalidation.
- *
- * On a flat-rate or subscription provider that does not bill cache writes separately, this
- * gate only costs context relief and can be lowered.
+ * where `f` is the share of the prompt the prune frees. This constant is only the floor
+ * against chatter: the real gap is computed per prune from the measured `f`
+ * (`JevPruner.requiredCallsBetweenPrunes`), so a read-heavy session that frees 40 % is
+ * allowed to prune every ~23 calls while a result-only session waits ~80.
  */
-const DEFAULT_MIN_CALLS_BETWEEN_PRUNES = 80;
+const DEFAULT_MIN_CALLS_BETWEEN_PRUNES = 20;
+
+/** Extra read-equivalents a rewritten prompt token costs at a write/read price ratio of ~10. */
+const CACHE_REWRITE_PENALTY = 9;
+
+/** Assumed freed share before the first prune, when there is nothing to measure yet. */
+const ASSUMED_FREED_FRACTION = 0.15;
 
 /** Characters of each pending result handed to Jev inside the question (300 ≈ a stack trace head). */
 const DEFAULT_STATE_RESULT_HEAD_CHARS = 300;
@@ -427,6 +428,25 @@ export function toJevMessages(messages: readonly PiMessage[]): JevMessage[] {
 	});
 }
 
+/**
+ * True when the last request already rewrote its own prompt prefix — a cache miss that was
+ * going to happen anyway — so a prune now costs no extra cache write. Evidence: a large
+ * share of the last prompt was billed as uncached input.
+ */
+export function cacheAlreadyCold(messages: readonly PiMessage[]): boolean {
+	for (let index = messages.length - 1; index >= 0; index -= 1) {
+		const message = messages[index] as {
+			role?: string;
+			usage?: { input?: number; cacheRead?: number; cacheWrite?: number };
+		};
+		if (message.role !== "assistant" || !message.usage) continue;
+		const prompt = (message.usage.input ?? 0) + (message.usage.cacheRead ?? 0) + (message.usage.cacheWrite ?? 0);
+		if (prompt <= 0) return false;
+		return (message.usage.input ?? 0) / prompt > 0.25;
+	}
+	return false;
+}
+
 function assistantHasThinking(message: PiMessage | undefined): boolean {
 	return message !== undefined && asParts(message.content).some((part) => part.type === "thinking");
 }
@@ -636,6 +656,8 @@ export class JevPruner {
 	#requests = 0;
 	#failures = 0;
 	#windowedRuns = 0;
+	#lastFreedFraction = 0;
+	#maxFreedFraction = 0;
 	#lastError: string | undefined;
 	#lastAttemptAt = 0;
 
@@ -678,6 +700,23 @@ export class JevPruner {
 	/** Prunes whose state only covered the fallback window. */
 	get windowedRuns(): number {
 		return this.#windowedRuns;
+	}
+
+	/** Share of the prompt the last prune freed, for diagnostics. */
+	get freedFraction(): number {
+		return this.#lastFreedFraction;
+	}
+
+	/**
+	 * How many further LLM calls must pass before a prune can pay for the cache write it
+	 * causes. Derived from the best share any prune has freed so far — a single thin sample
+	 * (early in a session, when little movable mass exists yet) must not lock the gate shut —
+	 * and bounded, so the gate is always re-evaluated.
+	 */
+	get requiredCallsBetweenPrunes(): number {
+		const freed = this.#maxFreedFraction > 0 ? this.#maxFreedFraction : ASSUMED_FREED_FRACTION;
+		const auto = Math.ceil(CACHE_REWRITE_PENALTY / Math.max(freed, 0.05));
+		return Math.min(200, Math.max(this.#options.minCallsBetweenPrunes, auto));
 	}
 
 	/** Message of the most recent failure, for diagnostics. */
@@ -760,6 +799,11 @@ export class JevPruner {
 		);
 		if (!applied) return null;
 		const charsAfter = JSON.stringify(applied.messages).length;
+		if (charsAfter < charsBefore) {
+			const freed = (charsBefore - charsAfter) / charsBefore;
+			this.#lastFreedFraction = freed;
+			if (freed > this.#maxFreedFraction) this.#maxFreedFraction = freed;
+		}
 		return {
 			messages: applied.messages,
 			decisions,
@@ -1144,10 +1188,11 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
 		// enough further calls: see DEFAULT_MIN_CALLS_BETWEEN_PRUNES.
 		const urgent = window > 0 && used >= window * 0.85;
 		state.callsSincePrune += 1;
-		const minCallsBetweenPrunes =
-			state.config.minCallsBetweenPrunes ?? DEFAULT_MIN_CALLS_BETWEEN_PRUNES;
+		const minCallsBetweenPrunes = pruner.requiredCallsBetweenPrunes;
+		// A cache miss that was going to happen anyway makes a prune free of extra cost.
+		const freeMoment = cacheAlreadyCold(event.messages as unknown as PiMessage[]);
 		const allowNetwork =
-			used >= trigger && (state.callsSincePrune >= minCallsBetweenPrunes || urgent);
+			used >= trigger && (state.callsSincePrune >= minCallsBetweenPrunes || urgent || freeMoment);
 
 		let outcome: PruneOutcome | null;
 		try {
@@ -1235,7 +1280,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
 					`may be dropped outright: ${(state.config.readOnlyTools ?? DEFAULT_READ_ONLY_TOOLS).join(", ") || "(nothing)"}; other tools keep their call`,
 					`result head shown to Jev: ${state.config.stateResultHeadChars} chars`,
 					`min new calls/requests: ${state.config.minNewCalls}/${state.config.minIntervalMs}ms`,
-					`calls between prunes: ${minCallsBetweenPrunes} (${Number.isFinite(state.callsSincePrune) ? state.callsSincePrune : "-"} since the last one)`,
+					`calls between prunes: ${minCallsBetweenPrunes} required (${Number.isFinite(state.callsSincePrune) ? state.callsSincePrune : "-"} since the last one; last prune freed ${((pruner?.freedFraction ?? 0) * 100).toFixed(1)}%)`,
 					`cached decisions: ${pruner?.cacheSize ?? 0}, requests this session: ${pruner?.requests ?? 0}${pruner?.failures ? `, ${pruner.failures} failed` : ""}${pruner?.windowedRuns ? `, ${pruner.windowedRuns} windowed` : ""}`,
 					...(pruner?.lastError ? [`last error: ${pruner.lastError}`] : []),
 					state.lastStatus ?? "last prune: none",

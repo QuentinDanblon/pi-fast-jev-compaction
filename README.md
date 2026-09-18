@@ -104,7 +104,7 @@ The footer shows a one-line summary when a prune happens:
   "minNewCalls": 2,
   "minPendingChars": 2000,
   "minIntervalMs": 5000,
-  "minCallsBetweenPrunes": 80,
+  "minCallsBetweenPrunes": 20,
   "fallbackWindowMessages": 120,
   "requestConcurrency": 4,
   "stateResultHeadChars": 300,
@@ -149,15 +149,21 @@ Cost control — the state is re-sent every request, so a round-trip must be wor
   characters, and when `minIntervalMs` has passed since the last attempt — an attempt is
   recorded even when it fails, so a broken key costs one timeout per interval instead of one
   per request;
-- `minCallsBetweenPrunes` (default 80) is the cache-cost gate, and the most important one:
-  removing an old call rewrites the prompt prefix, so the cached suffix becomes a cache
-  **write** instead of a cheap **read** (~10x the price on Anthropic/DeepSeek pricing, i.e. 9
-  extra read-equivalents per rewritten token). A prune that frees a fraction `f` of the prompt
-  only pays for itself after `(write/read − 1) / f` further LLM calls. With the safe defaults
-  `f` is measured at ~0.11, which puts break-even near **80 calls**; with whole calls deletable
-  (`f` ~ 0.3) it drops to ~30. Fewer, larger prunes beat continuous trimming. On a flat-rate or
-  subscription provider that does not bill cache writes separately, this gate only costs
-  context relief and can be lowered;
+- `minCallsBetweenPrunes` (default 20) is only the **floor** of the cache-cost gate; the real
+  gap is computed per prune. Removing an old call rewrites the prompt prefix, so the cached
+  suffix becomes a cache **write** instead of a cheap **read** (~10x the price on
+  Anthropic/DeepSeek pricing, i.e. 9 extra read-equivalents per rewritten token). A prune that
+  frees a share `f` of the prompt only pays for itself after `(write/read − 1) / f` further LLM
+  calls, and the pruner measures its own `f` (`freedFraction`) after each prune, keeping the
+  best share it has seen (a thin early sample must not lock the gate shut) and bounding the gap
+  to 20–200 calls so it is always re-evaluated: a read-heavy session that frees 40 % may prune
+  every ~23 calls, a result-only session that frees 8 % waits ~113. Before the first prune it
+  assumes 15 % (60 calls). Fewer, larger prunes beat continuous trimming;
+- a request whose prompt was **already uncached** (`cacheAlreadyCold`: the last response was
+  billed mostly as uncached input, i.e. the provider's cache had already expired or been
+  invalidated) is a free moment: the prune then costs no extra cache write and is allowed
+  immediately. On a flat-rate or subscription provider that does not bill cache writes
+  separately, `minCallsBetweenPrunes` only costs context relief and can be set to 0;
 - above 85 % of the window all of that is bypassed (`urgent`), because a full window is worse
   than an invalidation;
 
@@ -233,6 +239,19 @@ message content:
 ```sh
 node --import jiti/register tools/measure-gain.ts ~/.pi/agent/sessions/<dir>/<session>.jsonl
 ```
+
+## Known headroom
+
+What is measured, and what could still move the needle:
+
+| Lever | Expected effect | Risk |
+| --- | --- | --- |
+| Abridge long arguments of *all* old kept calls, not only those whose result is dropped (`abridgeArgumentChars` is currently ignored for `keep` decisions) | arguments are ~30 % of the payload (590 KB in the measured session) for ~1.2 KB per call, so a lower threshold would move `f` well past 11 % | the model loses exact old commands/paths; heads must be kept |
+| Strip thinking blocks from all but the newest turns | thinking was 32 % of the text in the measured session — the single biggest block | providers sign reasoning payloads; only safe where the provider ignores previous-turn thinking |
+| Persist the decision cache (`pi.appendEntry`) | a resumed or reloaded session currently re-pays every Jev request | entries grow with the session |
+| Group decisions (`choice` question per batch of calls) | fewer questions per request, so fewer of the 25k-token states are re-sent | coarser signal, needs measuring against per-call `noul` |
+| Smaller state (`maxStateTokens`) | 3-5x more questions per request, so a 3-5x cheaper session for Jev | Jev sees less context, so decisions get worse |
+| Cache-write-aware free moments: `/compact`, session start, provider cache TTL expiry | invalidation for free, so the `minCallsBetweenPrunes` gate can be ignored | none identified; only detects the *following* request |
 
 ## Limits
 
