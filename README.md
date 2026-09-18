@@ -23,25 +23,29 @@ a tool-call/result pairing that would break the provider — the unmodified mess
 ## Measured gain
 
 `tools/simulate-session.ts` replays a session the way pi drives it — one LLM call per assistant
-message, the same gates as the `context` hook, real Jev answers — and prices both effects: the
+message, the same gate as the `context` hook, real Jev answers — and prices both effects: the
 tokens a prune removes from every later call, and one prompt rewrite per prune that changes the
-prefix (a cache write costs `ratio` × a cache read, `ratio` = 10 by default).
+prefix (a cache write costs `ratio` × a cache read, `ratio` = 10 by default). Runs use frozen
+snapshots of the session files so they are comparable, and an optional decision cache so an
+experiment can be re-run almost for free.
 
-Two real sessions, default configuration, on frozen snapshots so runs are comparable:
+Two real sessions, default configuration:
 
 | | screenshots 1704×1307 | screenshots 1440×900 |
 | --- | --- | --- |
 | messages / LLM calls / tool calls | 1187 / 537 / 536 | 1401 / 673 / 672 |
-| prompt bill (message payload, conservative) | 299 M tok | 350 M tok |
-| prunes / prompt invalidations / Jev requests | 20 / 20 / 50 | 27 / 26 / 66 |
-| saved | 100.6 M tok | 154.9 M tok |
-| cache penalty | 8.5 M tok | 11.6 M tok |
-| **net** | **+92.1 M tok = +33.6 %** | **+143.3 M tok = +40.9 %** |
-| net if `details` are billed too | +43.4 % | +52.9 % |
-| failures | 0 | 1 (one Jev timeout, recovered) |
+| prompt bill (message payload) | 299 M tok | 350 M tok |
+| prunes / prompt invalidations / Jev requests | 20 / 20 / 50 | 13 / 15 / 27 |
+| saved | 100.6 M tok | 140.2 M tok |
+| cache penalty | 8.5 M tok | 8.0 M tok |
+| **net with the default (scoring in the background)** | **+31.8 %** | **+37.7 %** |
+| net if scoring blocks the request path | +33.6 % | +40.9 % |
+| failures | 0 | 0 |
 
 Both sessions are tool-output-heavy: ~90 % of the payload is tool results, most of it base64
 screenshots at ~2500 tokens each — exactly the mass this extension truncates.
+`tools/token-model.ts` reads the dimensions out of the PNG/JPEG headers and prices images the way
+providers do (longest side capped at 1568 px, ~750 px per token) instead of guessing a flat cost.
 
 What the matrix settled, each row measured on the same snapshot:
 
@@ -52,19 +56,25 @@ What the matrix settled, each row measured on the same snapshot:
 | `--trigger=0.85` (valve only, near-full window) | net **+0.5 %** — the penalty eats the saving |
 | `--abridge=0` | net 33.6 % → 33.5 % |
 | `--head=0` (Jev sees only lengths, as upstream) | identical decisions, 34 vs 50 requests |
+| `--background` (score off the request path) | net 33.6 % → 31.8 % |
 | `ratio=1` (flat-rate billing) | net 33.6 % → 36.7 % (what the cache penalty costs) |
+
+The latency `--background` removes: 2984 ms inside the hook over the session in blocking mode
+(with the experiment cache answering locally) versus 322 ms in background mode. With real network
+round-trips — 20 prunes × ~1 s — that is roughly 20 s of added wall-clock per session, which is why
+background scoring is the default and the 1.8 point cost is accepted.
 
 Three caveats, stated plainly:
 
-- **`details` are not credited**, because it is not established that providers receive pi's
-tool-specific metadata; crediting them adds ~10 points. The conservative column is the headline.
-- **Absolute tokens carry large uncertainty.** pi's own reported usage is ~0.67× this model on
-these image-heavy sessions, and image pricing is a formula, not a measurement. The *ratios*
-compare one basis throughout, so the percentages are the defensible claim. No text-heavy session
-was available to measure, so this says nothing about them.
-- **What cannot be touched at all:** thinking blocks, user text and assistant text. On the
-measured sessions that left results, their `details`, the abridged arguments of kept calls and
-provably read-only calls — about half the payload.
+- **`details` are not credited, and that is verified rather than assumed:** pi's Anthropic and
+  OpenAI-compatible serializers build tool results from `content`, `isError` and `toolCallId` only,
+  so tool-specific metadata never reaches a model or its cache. Dropping it changes no prompt token.
+- **Absolute tokens carry large uncertainty.** pi's own reported usage is ~0.65–0.67× this model on
+  these image-heavy sessions, and image pricing is a formula, not a measurement. The *ratios* compare
+  one basis throughout, so the percentages are the defensible claim, and they say nothing about
+  text-heavy sessions — none was available to measure.
+- **What cannot be touched at all:** thinking blocks, user text and assistant text. On the measured
+  sessions the movable mass is tool results and the abridged arguments of kept calls.
 
 Deleting whole tool calls (upstream's behaviour) would add roughly 10 points more, by removing the
 record of `write`, `edit` and shell commands that launch harnesses. This port refuses that by
@@ -120,6 +130,7 @@ The footer shows a one-line summary when a prune happens:
   "minPendingChars": 2000,
   "minIntervalMs": 5000,
   "minCallsBetweenPrunes": 20,
+  "pruneInBackground": true,
   "fallbackWindowMessages": 120,
   "requestConcurrency": 4,
   "stateResultHeadChars": 300,
@@ -148,12 +159,20 @@ Environment overrides: `FAST_JEV_ENABLED`, `FAST_JEV_TRIGGER_FRACTION`,
 1. Tool calls are paired with their results by tool-call id. Calls in the first message or in
    the newest `preserveRecentMessages` messages are pinned and never touched.
 2. The state sent to Jev is the whole conversation, oldest first, with tool results replaced
-   by a short note. It is fitted under `maxStateTokens` by progressively truncating inputs,
-   abridging old texts, collapsing old messages and reducing old calls to one line each.
+   by a short note and the head of the result under judgement appended to its question. It is fitted
+   under `maxStateTokens` by progressively truncating inputs, abridging old texts, collapsing old
+   messages and reducing old calls to one line each.
 3. Each non-pinned call gets two `noul` questions: should the call stay, and should its result
    stay verbatim.
 4. Questions are batched so state plus questions stay under `maxRequestTokens`, and batches run
    `requestConcurrency` at a time (the full state is re-sent with each request, as upstream does).
+5. With `pruneInBackground` (default) the requests are fired off and the call returns immediately
+   with the decisions already known; the new ones land on the next call. The session is never blocked
+   on Jev, at the cost of those decisions applying one call later.
+
+Decisions are persisted as they are taken (`pi.appendEntry`) and restored on `session_start`, so a
+reload or a resumed session does not re-pay for scores already bought. `/jev-compaction clear`
+forgets them, in memory and across reloads.
 
 Cost control — the state is re-sent every request, so a round-trip must be worth it:
 
@@ -171,9 +190,9 @@ Cost control — the state is re-sent every request, so a round-trip must be wor
   frees a share `f` of the prompt only pays for itself after `(write/read − 1) / f` further LLM
   calls, and the pruner measures its own `f` (`freedFraction`) after each prune, keeping the
   best share it has seen (a thin early sample must not lock the gate shut) and bounding the gap
-  to 20–200 calls so it is always re-evaluated: a read-heavy session that frees 40 % may prune
-  every ~23 calls, a result-only session that frees 8 % waits ~113. Before the first prune it
-  assumes 15 % (60 calls). Fewer, larger prunes beat continuous trimming;
+  to 20–200 calls so it is always re-evaluated. Before the first prune it assumes 15 % (60 calls).
+  This gate is the single most valuable one: without it, the same net gain costs 11× the requests
+  (measured);
 - a request whose prompt was **already uncached** (`cacheAlreadyCold`: the last response was
   billed mostly as uncached input, i.e. the provider's cache had already expired or been
   invalidated) is a free moment: the prune then costs no extra cache write and is allowed
@@ -242,7 +261,7 @@ then reduced to `dist/` + LICENSE + README + package.json, so no toolchain is co
 ```sh
 npm install
 npm run typecheck   # strict TypeScript
-npm test            # 27 behaviour tests, no network
+npm test            # 35 behaviour tests, no network
 npm run check       # both
 npm run vendor      # re-vendor the upstream library
 ```
@@ -274,7 +293,7 @@ rougher per-session figure.
 | --- | --- |
 | `index.ts` | the extension: gates, safety rules, `context` hook, `/jev-compaction` |
 | `image.ts` | image dimensions and cost, shared by the extension and the tools |
-| `test/*.test.ts` | 27 behaviour tests, fake Jev, no network |
+| `test/*.test.ts` | 35 behaviour tests, fake Jev, no network |
 | `tools/simulate-session.ts` | the measurement harness behind every number here |
 | `tools/token-model.ts` | shared token accounting (payload, images) |
 | `tools/measure-gain.ts` | quick per-session gain figure |
@@ -297,18 +316,20 @@ What measurement settled, and what is still open:
 - "valve only" (prune just before the window fills, `--trigger=0.85`) nets +0.5 %: too few prunes
   to cover the session, and the one penalty is paid in full;
 - the cache-cost gate is worth its keep: without it the net is *lower* (31.6 % vs 33.6 %) for 11×
-  the Jev requests.
+  the Jev requests;
+- scoring in the background costs 1.8 points and removes ~20 s of added wall-clock per session;
+- the decision cache survives a reload or a resume (`pi.appendEntry`), so nothing is re-paid;
+- `details` never reach the model (verified in pi's Anthropic and OpenAI-compatible serializers),
+  so no saving can come from them.
 
 **Still open:**
 
 | Lever | Expected effect | Risk |
 | --- | --- | --- |
-| Confirm whether providers actually receive pi's `details` | worth ~10 points if they do (it is ~30 % of the payload on these sessions) | none — it is a measurement, not a change |
+| Make `cacheAlreadyCold` also cover `/compact` and session start (a prefix that is being rewritten anyway) | invalidation at no extra cost, so the gate can be ignored there | none identified |
 | Strip thinking blocks from all but the newest turns | thinking is the largest unreachable block | providers sign reasoning payloads; only safe where previous-turn thinking is ignored |
-| Persist the decision cache (`pi.appendEntry`) | a reloaded or resumed session currently re-pays every Jev request | entries grow with the session |
 | Measure a text-heavy session | every measurable session here is screenshot-heavy; the text regime is unverified | none |
-| Group decisions (`choice` question per batch) | fewer questions per request, so fewer 25k states re-sent | coarser signal, must be measured against per-call `noul` |
-| Prune in a free moment: `/compact`, session start, provider cache TTL expiry | invalidation at no extra cost; `cacheAlreadyCold` already detects the *following* request | none identified |
+| Group decisions (`choice` question per batch) | fewer questions per request, so fewer 25k states re-sent (currently 27–50 Jev requests per session) | coarser signal, must be measured against per-call `noul` |
 
 ## Limits
 

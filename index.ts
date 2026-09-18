@@ -97,6 +97,11 @@ export interface FastJevConfig {
 	detectReadOnlyCommands?: boolean;
 	/** Abridge kept-call string arguments longer than this (default 500; 0 = off). */
 	abridgeArgumentChars?: number;
+	/**
+	 * Ask Jev in the background instead of blocking the LLM call (default true). The answers are
+	 * applied on the next call, so a prune never adds latency to the user's turn.
+	 */
+	pruneInBackground?: boolean;
 }
 
 type PruneConfig = ResolvedCompactOptions & {
@@ -195,6 +200,7 @@ const DEFAULT_CONFIG: Omit<FastJevConfig, "apiKey"> = {
 	readOnlyTools: DEFAULT_READ_ONLY_TOOLS,
 	detectReadOnlyCommands: true,
 	abridgeArgumentChars: 500,
+	pruneInBackground: true,
 	notify: true,
 	model: "jev-latest",
 	baseUrl: "https://api.typesafe.ai/v1/systemone",
@@ -452,6 +458,42 @@ function assistantHasThinking(message: PiMessage | undefined): boolean {
 	return message !== undefined && asParts(message.content).some((part) => part.type === "thinking");
 }
 
+/**
+ * The decision to spend a Jev request, isolated so it can be tested and audited.
+ *
+ * `size` keeps the extension out of small contexts, `gap` pays for the cache write a prune
+ * causes, `urgent` trades the cache for context when the window really fills, and `cold` uses a
+ * cache miss that was going to happen anyway. `urgent` and `cold` bypass the economic gap but
+ * never the configured floor, so neither can turn into a per-request amplifier.
+ */
+export interface AskGate {
+	usedTokens: number;
+	contextWindow: number;
+	triggerFraction: number;
+	urgentFraction: number;
+	callsSincePrune: number;
+	/** Gap derived from the share the last prunes freed (economic). */
+	economicGap: number;
+	/** Configured floor, in LLM calls. */
+	floorGap: number;
+	/** The previous response already rewrote its prompt prefix. */
+	cacheCold: boolean;
+}
+
+export type AskReason = "size" | "urgent" | "cache-cold" | "too-early" | "below-trigger" | "no-window";
+
+export function shouldAskJev(gate: AskGate): { ask: boolean; urgent: boolean; reason: AskReason } {
+	if (gate.contextWindow <= 0) return { ask: false, urgent: false, reason: "no-window" };
+	const urgent = gate.urgentFraction > 0 && gate.usedTokens >= gate.contextWindow * gate.urgentFraction;
+	if (gate.usedTokens < gate.contextWindow * gate.triggerFraction) {
+		return { ask: false, urgent, reason: "below-trigger" };
+	}
+	if (gate.cacheCold) return { ask: true, urgent, reason: "cache-cold" };
+	if (urgent && gate.callsSincePrune >= gate.floorGap) return { ask: true, urgent, reason: "urgent" };
+	if (gate.callsSincePrune >= gate.economicGap) return { ask: true, urgent, reason: "size" };
+	return { ask: false, urgent, reason: "too-early" };
+}
+
 /* ------------------------------------------------------------- the pruner */
 
 export interface PruneOutcome {
@@ -482,11 +524,24 @@ export interface PruneControls {
 	allowNetwork: boolean;
 	/** Ignore the minNewCalls/minIntervalMs gates (context nearly full). */
 	urgent?: boolean;
+	/**
+	 * Ask Jev in the background and return the view built from the decisions already known.
+	 * The answers land in the cache and are applied on the next call, which keeps a prune off
+	 * the caller's critical path. The host observes them through `takeNewDecisions()`.
+	 */
+	deferNetwork?: boolean;
 }
 
 interface CachedDecision {
 	keepCall: number;
 	keepResult: number;
+}
+
+/** A decision as persisted, keyed the same way as the in-memory cache. */
+export interface PersistedDecisions {
+	[key: string]: CachedDecision | boolean | undefined;
+	/** Set by `/jev-compaction clear`: everything restored before it is discarded. */
+	reset?: boolean;
 }
 
 function hash(text: string): string {
@@ -654,6 +709,9 @@ export class JevPruner {
 	#asker: JevAsker;
 	#options: PruneConfig;
 	#cache = new Map<string, CachedDecision>();
+	#persistQueue: PersistedDecisions = {};
+	#scoring = false;
+	#background: { requests: number; ms: number; windowed: boolean } | undefined;
 	#requests = 0;
 	#failures = 0;
 	#windowedRuns = 0;
@@ -727,6 +785,39 @@ export class JevPruner {
 
 	clearCache(): void {
 		this.#cache.clear();
+		this.#persistQueue = {};
+	}
+
+	/** Decisions taken since the last call, so a host can persist them incrementally. */
+	takeNewDecisions(): PersistedDecisions {
+		const pending = this.#persistQueue;
+		this.#persistQueue = {};
+		return pending;
+	}
+
+	/** Restores decisions from earlier runs of the same session. Returns how many were new. */
+	restoreDecisions(decisions: readonly PersistedDecisions[]): number {
+		let restored = 0;
+		for (const batch of decisions) {
+			// A reset marker (written by `/jev-compaction clear`) discards everything before it.
+			if (batch.reset === true) {
+				this.#cache.clear();
+				restored = 0;
+				continue;
+			}
+			for (const [key, value] of Object.entries(batch)) {
+				if (key === "reset" || value === undefined || typeof value === "boolean") continue;
+				if (this.#cache.has(key)) continue;
+				this.#cache.set(key, value);
+				restored += 1;
+			}
+		}
+		return restored;
+	}
+
+	/** True while a scoring round is in flight, so a caller can avoid stacking more. */
+	get isScoring(): boolean {
+		return this.#scoring;
 	}
 
 	async prune(
@@ -745,14 +836,13 @@ export class JevPruner {
 		for (const call of calls) {
 			const key = cacheKeyFor(call, jevMessages);
 			keys.set(call.id, key);
-			const cached = this.#cache.get(key);
 			if (call.pinned) {
 				resolved.set(call.id, { keepCall: 1, keepResult: 1 });
-			} else if (cached) {
-				resolved.set(call.id, cached);
-			} else {
-				pending.push(call);
+				continue;
 			}
+			const cached = this.#cache.get(key);
+			if (cached) resolved.set(call.id, cached);
+			else pending.push(call);
 		}
 
 		const pendingChars = pending.reduce((sum, call) => sum + call.resultChars, 0);
@@ -768,8 +858,32 @@ export class JevPruner {
 			// Recorded before the call so a hanging or failing Jev is retried at most
 			// once per interval instead of on every LLM request.
 			this.#lastAttemptAt = Date.now();
-			scored = await this.#scorePending(jevMessages, calls, pending, resolved);
-			if (scored.windowed) this.#windowedRuns += 1;
+			if (controls.deferNetwork === true) {
+				// Fire and forget: the answers are cached and applied on the next prune, so the
+				// caller is never blocked by Jev. One round at a time.
+				if (!this.#scoring) {
+					const started = Date.now();
+					void this.#scorePending(jevMessages, calls, pending, keys)
+						.then((result) => {
+							this.#background = { requests: result.requests, ms: Date.now() - started, windowed: result.windowed };
+						})
+						.catch(() => undefined);
+				}
+			} else {
+				scored = await this.#scorePending(jevMessages, calls, pending, keys);
+				for (const call of pending) {
+					const answer = this.#cache.get(keys.get(call.id) ?? "");
+					if (answer) resolved.set(call.id, answer);
+				}
+			}
+		}
+		// A background round that finished since the last call reports its cost exactly once.
+		if (this.#background) {
+			if (this.#background.windowed) this.#windowedRuns += 1;
+			scored = { requests: this.#background.requests, stateTokens: 0, windowed: this.#background.windowed };
+			this.#background = undefined;
+		} else if (scored.windowed) {
+			this.#windowedRuns += 1;
 		}
 
 		const decisions: PruneDecision[] = calls.map((call) => {
@@ -783,7 +897,11 @@ export class JevPruner {
 					toolUseId: call.tool_use_id,
 				};
 			}
-			if (!call.pinned) this.#cache.set(key, answer);
+			if (!call.pinned) {
+				// #scorePending already committed the answer to the cache (it has to, because
+				// the deferred path has no caller to hand the answers to).
+				resolved.set(call.id, answer);
+			}
 			const decision: PruneDecision = {
 				...decideCall(call, { keepCall: answer.keepCall, keepResult: answer.keepResult }, this.#options),
 				toolUseId: call.tool_use_id,
@@ -878,7 +996,7 @@ export class JevPruner {
 		jevMessages: readonly JevMessage[],
 		calls: readonly ToolCall[],
 		pending: readonly ToolCall[],
-		resolved: Map<string, CachedDecision>,
+		keys: ReadonlyMap<string, string>,
 	): Promise<{ requests: number; stateTokens: number; windowed: boolean }> {
 		const pendingByToolUseId = new Map(pending.map((call) => [call.tool_use_id, call]));
 		const headChars = this.#options.stateResultHeadChars;
@@ -921,7 +1039,9 @@ export class JevPruner {
 		}
 
 		let requests = 0;
-		await mapWithConcurrency(batches, this.#options.requestConcurrency, async (batch) => {
+		this.#scoring = true;
+		try {
+			await mapWithConcurrency(batches, this.#options.requestConcurrency, async (batch) => {
 			const questions = Object.assign({}, ...batch.map(questionsOf));
 			try {
 				const response = await this.#asker.ask(state, questions);
@@ -932,16 +1052,22 @@ export class JevPruner {
 					// decisions are keyed by the pending call, i.e. by tool-call id.
 					const target = pendingByToolUseId.get(asked.tool_use_id);
 					if (!target) continue;
-					resolved.set(target.id, {
+					const answer = {
 						keepCall: noulAnswer(response.answers, `call_${asked.id}`),
 						keepResult: noulAnswer(response.answers, `result_${asked.id}`),
-					});
+					};
+					const key = keys.get(target.id) ?? cacheKeyFor(target, jevMessages);
+					this.#cache.set(key, answer);
+					this.#persistQueue[key] = answer;
 				}
 			} catch (error) {
 				// Leave this batch unscored: those calls stay verbatim, uncached.
 				this.#recordFailure(error);
 			}
 		});
+		} finally {
+			this.#scoring = false;
+		}
 		return { requests, stateTokens, windowed };
 	}
 
@@ -1096,6 +1222,12 @@ function pairingIntact(messages: readonly PiMessage[], paired: ReadonlySet<strin
 
 /* ------------------------------------------------------------- extension */
 
+/**
+ * Session entry type used to persist Jev decisions, so a `/reload` or a resumed session does
+ * not pay for the same questions again (and keeps pruning the same calls the same way).
+ */
+const DECISIONS_ENTRY_TYPE = "fast-jev-decisions";
+
 interface PrunerState {
 	config: FastJevConfig;
 	pruner: JevPruner | undefined;
@@ -1106,6 +1238,8 @@ interface PrunerState {
 	notifiedWindowed: boolean;
 	/** LLM calls seen since the last prune that asked Jev something. */
 	callsSincePrune: number;
+	/** Decisions restored from earlier runs, applied when the pruner is built. */
+	restoredDecisions: PersistedDecisions[];
 }
 
 function buildPruner(config: FastJevConfig, apiKey: string): JevPruner {
@@ -1153,6 +1287,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
 		notifiedFailures: 0,
 		notifiedWindowed: false,
 		callsSincePrune: Number.POSITIVE_INFINITY,
+		restoredDecisions: [],
 	};
 
 	const ensurePruner = (ctx: ExtensionContext): JevPruner | undefined => {
@@ -1170,6 +1305,13 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
 				return undefined;
 			}
 			state.pruner = buildPruner(state.config, state.apiKey);
+			if (state.restoredDecisions.length > 0) {
+				const restored = state.pruner.restoreDecisions(state.restoredDecisions);
+				state.restoredDecisions = [];
+				if (state.config.notify) {
+					ctx.ui.notify(`fast-jev-compaction: ${restored} decision(s) restored from this session`, "info");
+				}
+			}
 			if (state.config.notify) {
 				if (keyFileIsLoose()) {
 					ctx.ui.notify(
@@ -1190,26 +1332,41 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
 		const usage = ctx.getContextUsage();
 		const window = usage?.contextWindow ?? 0;
 		const used = usage?.tokens ?? estimateTokens(JSON.stringify(event.messages));
-		const trigger = window > 0 ? window * state.config.triggerFraction : Number.POSITIVE_INFINITY;
 		// A prune rewrites the prompt prefix, so the cached suffix becomes a cache write
 		// (roughly 10x the price of a read). One prune therefore has to be amortised over
 		// enough further calls: see DEFAULT_MIN_CALLS_BETWEEN_PRUNES.
-		const urgent = window > 0 && used >= window * 0.85;
 		state.callsSincePrune += 1;
+		const gate = shouldAskJev({
+			usedTokens: used,
+			contextWindow: window,
+			triggerFraction: state.config.triggerFraction,
+			urgentFraction: 0.85,
+			callsSincePrune: state.callsSincePrune,
+			economicGap: pruner.requiredCallsBetweenPrunes,
+			floorGap: state.config.minCallsBetweenPrunes ?? DEFAULT_MIN_CALLS_BETWEEN_PRUNES,
+			cacheCold: cacheAlreadyCold(event.messages as unknown as PiMessage[]),
+		});
+		const urgent = gate.urgent;
 		const minCallsBetweenPrunes = pruner.requiredCallsBetweenPrunes;
-		// A cache miss that was going to happen anyway makes a prune free of extra cost.
-		const freeMoment = cacheAlreadyCold(event.messages as unknown as PiMessage[]);
-		const allowNetwork =
-			used >= trigger && (state.callsSincePrune >= minCallsBetweenPrunes || urgent || freeMoment);
+		const freeMoment = gate.reason === "cache-cold";
+		const allowNetwork = gate.ask;
 
 		let outcome: PruneOutcome | null;
 		try {
-			outcome = await pruner.prune(event.messages as unknown as PiMessage[], { allowNetwork, urgent });
+			outcome = await pruner.prune(event.messages as unknown as PiMessage[], {
+				allowNetwork,
+				urgent,
+				deferNetwork: state.config.pruneInBackground ?? true,
+			});
 		} catch (error) {
 			ctx.ui.notify(`fast-jev-compaction: ${messageReason(error)}`, "error");
 			return;
 		}
 		if (outcome && outcome.stats.requests > 0) state.callsSincePrune = 0;
+		// Drained every call: a background round commits its decisions without a caller to hand
+		// them to, so persistence cannot wait for a prune that reported requests itself.
+		const fresh = pruner.takeNewDecisions();
+		if (Object.keys(fresh).length > 0) pi.appendEntry(DECISIONS_ENTRY_TYPE, fresh);
 		if (!outcome) return;
 
 		if (state.config.notify && pruner.failures > state.notifiedFailures) {
@@ -1248,7 +1405,11 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
 			}
 			if (command === "clear") {
 				state.pruner?.clearCache();
-				ctx.ui.notify("fast-jev-compaction: decision cache cleared", "info");
+				state.restoredDecisions = [];
+				// A marker, because earlier decisions are already in the session and would come back
+				// on the next reload.
+				pi.appendEntry(DECISIONS_ENTRY_TYPE, { reset: true });
+				ctx.ui.notify("fast-jev-compaction: decision cache cleared (also for future reloads)", "info");
 				return;
 			}
 			if (command === "probe") {
@@ -1305,5 +1466,22 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
 		state.pruner?.clearCache();
 		state.pruner = undefined;
 		state.apiKey = undefined;
+	});
+
+	// Decisions live in the session, not only in memory: after `/reload` or a resume the same
+	// calls keep the same answer, and the Jev requests are not paid twice.
+	pi.on("session_start", async (_event, ctx) => {
+		state.restoredDecisions = [];
+		for (const entry of ctx.sessionManager.getEntries()) {
+			const candidate = entry as { type?: string; customType?: string; data?: unknown };
+			if (candidate.type !== "custom" || candidate.customType !== DECISIONS_ENTRY_TYPE) continue;
+			const data = candidate.data as PersistedDecisions | { reset?: boolean } | undefined;
+			if (data === undefined) continue;
+			if ((data as { reset?: boolean }).reset === true) {
+				state.restoredDecisions = [];
+				continue;
+			}
+			state.restoredDecisions.push(data as PersistedDecisions);
+		}
 	});
 }

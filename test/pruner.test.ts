@@ -489,6 +489,50 @@ test("the cache gate tunes itself from the share a prune actually frees", async 
 	assert.ok(fat.requiredCallsBetweenPrunes <= 25, `expected a short gap, got ${fat.requiredCallsBetweenPrunes}`);
 });
 
+test("decisions survive a reload: they can be drained and restored", async () => {
+	const messages = transcript();
+	const asker = new FakeAsker({ call_t1: 0, result_t1: 0, call_t2: 0, result_t2: 0, call_t3: 1, result_t3: 1 });
+	const first = pruner(asker);
+	const outcome = await first.prune(messages, { allowNetwork: true });
+	assert.ok(outcome);
+	const persisted = first.takeNewDecisions();
+	assert.equal(Object.keys(persisted).length, 3, "one entry per scored call");
+	assert.deepEqual(first.takeNewDecisions(), {}, "draining is a one-shot");
+
+	// A fresh pruner (what a /reload builds) with the same session must not ask again.
+	const reloaded = pruner(new FakeAsker({}));
+	assert.equal(reloaded.restoreDecisions([persisted]), 3);
+	const again = await reloaded.prune(messages, { allowNetwork: true });
+	assert.ok(again, "the restored decisions are applied straight away");
+	assert.equal(reloaded.requests, 0, "nothing is asked again after a reload");
+	assert.deepEqual(again.messages, outcome.messages, "and the view is identical");
+
+	// A reset marker (what /jev-compaction clear appends) discards everything restored.
+	const cleared = pruner(new FakeAsker({}));
+	cleared.restoreDecisions([persisted, { reset: true } as never]);
+	assert.equal(cleared.cacheSize, 0);
+});
+
+test("background scoring never blocks the caller", async () => {
+	const asker = new FakeAsker({ call_t1: 1, result_t1: 0 });
+	const instance = pruner(asker);
+	const messages = transcript();
+
+	// First call: Jev is asked in the background, so this call cannot apply the answer yet.
+	const immediate = await instance.prune(messages, { allowNetwork: true, deferNetwork: true });
+	assert.equal(immediate, null, "no decision is applied on the call that asks");
+
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert.equal(instance.isScoring, false, "the background round is done");
+	assert.equal(Object.keys(instance.takeNewDecisions()).length, 3, "it committed every answer");
+
+	// Next call: the cached decisions apply, and the background request is reported once.
+	const later = await instance.prune(messages, { allowNetwork: false });
+	assert.ok(later);
+	assert.equal(later.stats.requests, 1, "the background request is reported on the next call");
+	assert.equal(later.stats.resultsDropped, 1);
+});
+
 test("a request whose prompt was already uncached is a free moment to prune", () => {
 	const withUsage = (usage: Record<string, number>): PiMessage[] => [
 		{ role: "assistant", content: [{ type: "text", text: "hi" }], usage } as unknown as PiMessage,

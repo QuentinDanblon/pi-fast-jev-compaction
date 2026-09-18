@@ -58,6 +58,8 @@ const headChars = option("head", 300);
 const abridgeChars = option("abridge", 500);
 const ratio = option("ratio", 10);
 const freeMoment = !flag("no-free-moment");
+/** Ask Jev in the background instead of blocking the simulated LLM call. */
+const background = flag("background");
 const minPendingChars = option("min-pending", config.minPendingChars ?? 2_000);
 const minNewCalls = option("min-new", config.minNewCalls ?? 2);
 const cachePath = args.find((arg) => arg.startsWith("--cache="))?.slice(8);
@@ -237,6 +239,7 @@ let penaltyTokens = 0;
 let penaltyConservative = 0;
 let invalidations = 0;
 let promptSum = 0;
+let blockedMs = 0;
 let callsSincePrune = Number.POSITIVE_INFINITY;
 let required = gapArg === "auto" ? 20 : Number(gapArg);
 const floorGap = gapArg === "auto" ? 20 : Number(gapArg);
@@ -278,7 +281,9 @@ for (let index = 0; index < messages.length; index += 1) {
 	const allowNetwork =
 		trustablePrompt >= window * trigger && (callsSincePrune >= gap || (freeMoment && coldNow));
 
-	const outcome = await pruner.prune(full, { allowNetwork, urgent });
+	const pruneStarted = Date.now();
+	const outcome = await pruner.prune(full, { allowNetwork, urgent, deferNetwork: background });
+	if (outcome && outcome.stats.requests > 0) blockedMs += Date.now() - pruneStarted;
 	if (flag("debug") && outcome && outcome.stats.requests > 0 && (prunes < 6 || calls > Number(process.env.DEBUG_FROM ?? 395))) {
 		const before = measurePayload(full);
 		const after = measurePayload(outcome.messages);
@@ -364,6 +369,10 @@ if (!quiet) {
 		`  activity     : ${prunes} prune(s), ${invalidations} prompt invalidation(s), ${requests} Jev request(s), ${judged}/${calls} calls judged, ${asker.hits} cached answers, ${pruner.failures} failure(s)`,
 	);
 	console.log(`  context      : prompt bill ${kb(promptSum)}, max ${kb(maxPrompt)}, final sent ${kb(trajectory.at(-1) ?? 0)}`);
+	console.log(
+		`  latency      : ${blockedMs} ms spent inside the hook across the session` +
+			(background ? " (background mode: nothing blocks)" : " (blocking mode)"),
+	);
 	if (usageRatios.length > 0) {
 		const sorted = [...usageRatios].sort((a, b) => a - b);
 		const median = sorted[Math.floor(sorted.length / 2)] ?? 0;
