@@ -1,0 +1,43 @@
+{
+	"name": "pi-fast-jev-compaction",
+	"version": "0.1.0",
+	"description": "Verbatim context pruning for the pi coding agent, scored by TypeSafe Jev: stale tool calls and results are dropped or truncated, everything kept stays verbatim.",
+	"license": "MIT",
+	"type": "module",
+	"private": false,
+	"engines": {
+		"node": ">=20"
+	},
+	"keywords": [
+		"pi-package",
+		"pi",
+		"pi-coding-agent",
+		"extension",
+		"context",
+		"compaction",
+		"jev",
+		"typesafe"
+	],
+	"pi": {
+		"extensions": ["./index.ts"]
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/QuentinDanblon/pi-fast-jev-compaction.git"
+	},
+	"scripts": {
+		"typecheck": "tsc -p tsconfig.json",
+		"test": "node --import jiti/register --test test/pruner.test.ts test/config.test.ts",
+		"check": "npm run typecheck && npm test",
+		"vendor": "node scripts/vendor.mjs"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "^0.85.1",
+		"@types/node": "^22.10.2",
+		"jiti": "^2.7.0",
+		"typescript": "^5.7.2"
+	}
+}

@@ -1,0 +1,12 @@
+node_modules/
+vendor/fast-jev-compaction/node_modules/
+/dist/
+*.log
+.DS_Store
+Thumbs.db
+
+# never commit secrets
+.env
+.env.*
+fast-jev-compaction.json
+*fast-jev-key*

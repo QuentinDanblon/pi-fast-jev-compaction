@@ -1,0 +1,943 @@
+/**
+ * fast-jev-compaction for pi — verbatim context pruning scored by Jev.
+ *
+ * Port of https://github.com/tamaratran/fast-jev-compaction (MIT), vendored and
+ * built at ./vendor/fast-jev-compaction.
+ *
+ * Upstream is a Claude Code *function hook* that replaces the compaction
+ * summary: it never rewrites anything, it only deletes or truncates tool calls
+ * and results that Jev says are no longer needed, and keeps every other message
+ * verbatim. Pi's `session_before_compact` cannot express that (pi only persists
+ * a summary string plus a contiguous `firstKeptEntryId` tail), but pi's
+ * `pi.on("context")` hook runs before every LLM call and may return a modified
+ * message list. That is the faithful port target:
+ *
+ *   - nothing is ever persisted or rewritten: the session JSONL keeps the full
+ *     verbatim history, the pruning is a per-request view;
+ *   - tool calls and results Jev scores as stale are dropped or truncated;
+ *   - every other message is passed through untouched;
+ *   - decisions are cached per (tool call, input, result) so each call is
+ *     scored once instead of once per turn;
+ *   - any error, malformed answer or broken tool-call/tool-result pairing
+ *     aborts the rewrite and the unmodified messages are sent.
+ *
+ * Config: ~/.pi/agent/fast-jev-compaction.json (all keys optional) and/or
+ * FAST_JEV_* environment variables. The API key is read from
+ * FAST_JEV_API_KEY, JEV_API_KEY, TYPESAFE_API_KEY, config.apiKey, or the file
+ * ~/.pi/agent/fast-jev-key. Without a key the extension is a silent no-op.
+ */
+
+import { readFileSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+	batchCalls,
+	buildJevRequest,
+	collectToolCalls,
+	decideCall,
+	estimateTokens,
+	fitState,
+	noulAnswer,
+	parseJevResponse,
+	resolveOptions,
+	questionsFor,
+	type CallDecision,
+	type JevAsker,
+	type JevQuestions,
+	type JevState,
+	type Message as JevMessage,
+	type ResolvedCompactOptions,
+	type ToolCall,
+} from "./vendor/fast-jev-compaction/dist/index.js";
+
+/* ------------------------------------------------------------------ config */
+
+/** Config and key locations, overridable so they can be redirected and tested. */
+export function configPath(): string {
+	return process.env.FAST_JEV_CONFIG ?? join(homedir(), ".pi", "agent", "fast-jev-compaction.json");
+}
+
+export function keyPath(): string {
+	return process.env.FAST_JEV_KEY_FILE ?? join(homedir(), ".pi", "agent", "fast-jev-key");
+}
+
+export interface FastJevConfig {
+	enabled: boolean;
+	/** Share of the context window above which Jev is actually asked. */
+	triggerFraction: number;
+	/** Minimum new (uncached) candidates before a network round-trip. */
+	minNewCalls: number;
+	/** Total result chars a network round-trip must be able to free to be worth it. */
+	minPendingChars: number;
+	/** Minimum time between network round-trips. */
+	minIntervalMs: number;
+	/** Window (in messages) used when the full-conversation state cannot be fitted. */
+	fallbackWindowMessages: number;
+	/** Jev requests in flight per prune. */
+	requestConcurrency: number;
+	notify: boolean;
+	apiKey?: string;
+	model?: string;
+	baseUrl?: string;
+	timeoutMs: number;
+	/** Passed straight to the upstream library's `compact` options. */
+	keepThreshold?: number;
+	preserveRecentMessages?: number;
+	maxStateTokens?: number;
+	maxRequestTokens?: number;
+	truncateHeadChars?: number;
+}
+
+type PruneConfig = ResolvedCompactOptions & {
+	triggerFraction: number;
+	minNewCalls: number;
+	minPendingChars: number;
+	minIntervalMs: number;
+	timeoutMs: number;
+	fallbackWindowMessages: number;
+	requestConcurrency: number;
+};
+
+export type PruneOptions = Parameters<typeof resolveOptions>[0] &
+	Partial<
+		Pick<
+			PruneConfig,
+			| "triggerFraction"
+			| "minNewCalls"
+			| "minPendingChars"
+			| "minIntervalMs"
+			| "timeoutMs"
+			| "fallbackWindowMessages"
+			| "requestConcurrency"
+		>
+	>;
+/** One decision, tied back to the tool call it scores. */
+export interface PruneDecision extends CallDecision {
+	toolUseId: string;
+}
+
+const DEFAULT_CONFIG: Omit<FastJevConfig, "apiKey"> = {
+	enabled: true,
+	triggerFraction: 0.5,
+	minNewCalls: 2,
+	minPendingChars: 2_000,
+	minIntervalMs: 5_000,
+	fallbackWindowMessages: 120,
+	requestConcurrency: 4,
+	notify: true,
+	model: "jev-latest",
+	baseUrl: "https://api.typesafe.ai/v1/systemone",
+	timeoutMs: 10_000,
+};
+
+function envNumber(name: string): number | undefined {
+	const raw = process.env[name];
+	if (raw === undefined || raw.trim() === "") return undefined;
+	const value = Number(raw);
+	return Number.isFinite(value) ? value : undefined;
+}
+
+function envBool(name: string): boolean | undefined {
+	const raw = process.env[name]?.trim().toLowerCase();
+	if (raw === undefined || raw === "") return undefined;
+	return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
+function readJson<T>(path: string): Partial<T> | undefined {
+	try {
+		return JSON.parse(readFileSync(path, "utf8")) as Partial<T>;
+	} catch {
+		return undefined;
+	}
+}
+
+export function loadConfig(path: string = configPath()): FastJevConfig {
+	const file = readJson<FastJevConfig>(path) ?? {};
+	const merged: FastJevConfig = { ...DEFAULT_CONFIG, ...file };
+	const overrides: Partial<FastJevConfig> = {
+		enabled: envBool("FAST_JEV_ENABLED"),
+		triggerFraction: envNumber("FAST_JEV_TRIGGER_FRACTION"),
+		minNewCalls: envNumber("FAST_JEV_MIN_NEW_CALLS"),
+		minIntervalMs: envNumber("FAST_JEV_MIN_INTERVAL_MS"),
+		notify: envBool("FAST_JEV_NOTIFY"),
+		model: process.env.FAST_JEV_MODEL,
+		baseUrl: process.env.FAST_JEV_BASE_URL,
+		timeoutMs: envNumber("FAST_JEV_TIMEOUT_MS"),
+	};
+	for (const [key, value] of Object.entries(overrides)) {
+		if (value !== undefined) (merged as unknown as Record<string, unknown>)[key] = value;
+	}
+	return merged;
+}
+
+function firstNonEmpty(...values: (string | undefined)[]): string | undefined {
+	for (const value of values) {
+		const trimmed = value?.trim();
+		if (trimmed) return trimmed;
+	}
+	return undefined;
+}
+
+/**
+ * The key, in precedence order: FAST_JEV_API_KEY, JEV_API_KEY, TYPESAFE_API_KEY,
+ * `apiKey` in the config file, then the key file. Everything is trimmed; an empty
+ * value never wins.
+ */
+export function resolveApiKey(config: FastJevConfig, path: string = keyPath()): string | undefined {
+	let fromFile: string | undefined;
+	try {
+		fromFile = readFileSync(path, "utf8").trim();
+	} catch {
+		fromFile = undefined;
+	}
+	return firstNonEmpty(
+		process.env.FAST_JEV_API_KEY,
+		process.env.JEV_API_KEY,
+		process.env.TYPESAFE_API_KEY,
+		config.apiKey,
+		fromFile,
+	);
+}
+
+/**
+ * True when the key file is readable by group or others. Windows mode bits carry
+ * no such meaning, so the check is skipped there. Used for a one-time warning;
+ * the file is still read, because refusing the key would be a worse surprise.
+ */
+export function keyFileIsLoose(path: string = keyPath()): boolean {
+	if (process.platform === "win32") return false;
+	try {
+		return (statSync(path).mode & 0o077) !== 0;
+	} catch {
+		return false;
+	}
+}
+
+/* ------------------------------------------------------------------ asker */
+
+/** Jev over HTTP with an abortable timeout; no retries on the request path. */
+export class HttpJevAsker implements JevAsker {
+	#apiKey: string;
+	#model: string | undefined;
+	#baseUrl: string | undefined;
+	#timeoutMs: number;
+	#fetcher: typeof fetch;
+
+	constructor(options: { apiKey: string; model?: string; baseUrl?: string; timeoutMs?: number }) {
+		this.#apiKey = options.apiKey;
+		this.#model = options.model;
+		this.#baseUrl = options.baseUrl;
+		this.#timeoutMs = options.timeoutMs ?? DEFAULT_CONFIG.timeoutMs;
+		this.#fetcher = fetch;
+	}
+
+	async ask(state: JevState, questions: JevQuestions) {
+		const request = buildJevRequest(
+			{ apiKey: this.#apiKey, model: this.#model, baseUrl: this.#baseUrl },
+			state,
+			questions,
+		);
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), this.#timeoutMs);
+		try {
+			const response = await this.#fetcher(request.url, {
+				method: request.method,
+				headers: request.headers,
+				body: request.body,
+				signal: controller.signal,
+			});
+			return parseJevResponse(response.status, response.ok, await response.text());
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+}
+
+/* ------------------------------------------------- pi message conversion */
+
+type Part = { type: string; [key: string]: unknown };
+
+export interface PiMessage {
+	role: string;
+	content?: unknown;
+	toolCallId?: string;
+	toolName?: string;
+	isError?: boolean;
+	[custom: string]: unknown;
+}
+
+function asParts(content: unknown): Part[] {
+	if (Array.isArray(content)) return content as Part[];
+	if (typeof content === "string") return [{ type: "text", text: content }];
+	return [];
+}
+
+function partText(part: Part): string {
+	if (part.type === "text" && typeof part.text === "string") return part.text;
+	if (part.type === "thinking" && typeof part.thinking === "string") return part.thinking;
+	if (part.type === "image") return `[image: ${String(part.mimeType ?? "unknown")}]`;
+	return "";
+}
+
+function messageText(message: PiMessage): string {
+	if (typeof message.content === "string") return message.content;
+	return asParts(message.content)
+		.map(partText)
+		.filter((text) => text.length > 0)
+		.join("\n");
+}
+
+function messageReason(msg: unknown): string {
+	return msg instanceof Error ? msg.message : String(msg);
+}
+
+function toolCallParts(message: PiMessage): Part[] {
+	return asParts(message.content).filter((part) => part.type === "toolCall");
+}
+
+function resultText(message: PiMessage): string {
+	if (typeof message.content === "string") return message.content;
+	return asParts(message.content)
+		.map(partText)
+		.filter((text) => text.length > 0)
+		.join("\n");
+}
+
+/** pi `AgentMessage[]` -> the upstream library's Claude-shaped `Message[]`, 1:1. */
+export function toJevMessages(messages: readonly PiMessage[]): JevMessage[] {
+	return messages.map((message) => {
+		switch (message.role) {
+			case "toolResult": {
+				const id = String(message.toolCallId ?? "");
+				return {
+					role: "user" as const,
+					text: "",
+					toolUses: [],
+					toolResults: [
+						{ tool_use_id: id, text: resultText(message), isError: message.isError === true },
+					],
+				};
+			}
+			case "assistant": {
+				return {
+					role: "assistant" as const,
+					text: messageText(message),
+					toolUses: toolCallParts(message).map((part) => ({
+						tool_use_id: String(part.id ?? ""),
+						tool: String(part.name ?? "?"),
+						input: (part.arguments as Record<string, unknown> | undefined) ?? {},
+					})),
+				};
+			}
+			case "bashExecution": {
+				return {
+					role: "user" as const,
+					text: `$ ${String(message.command ?? "")}\n${String(message.output ?? "")}`,
+					toolUses: [],
+				};
+			}
+			case "compactionSummary":
+			case "branchSummary": {
+				return {
+					role: "user" as const,
+					text: String(message.summary ?? ""),
+					toolUses: [],
+				};
+			}
+			case "custom": {
+				return { role: "user" as const, text: messageText(message), toolUses: [] };
+			}
+			default: {
+				return {
+					role: (message.role === "assistant" ? "assistant" : "user") as "user" | "assistant",
+					text: messageText(message),
+					toolUses: [],
+				};
+			}
+		}
+	});
+}
+
+/* ------------------------------------------------------------- the pruner */
+
+export interface PruneOutcome {
+	messages: PiMessage[];
+	decisions: PruneDecision[];
+	stats: {
+		calls: number;
+		kept: number;
+		resultsDropped: number;
+		callsDropped: number;
+		pinned: number;
+		charsBefore: number;
+		charsAfter: number;
+		requests: number;
+		stateTokens: number;
+		/** True when the state only covered the fallback window. */
+		windowed: boolean;
+		ms: number;
+	};
+}
+
+export interface PruneControls {
+	/** When false, only cached decisions are applied (no network). */
+	allowNetwork: boolean;
+	/** Ignore the minNewCalls/minIntervalMs gates (context nearly full). */
+	urgent?: boolean;
+}
+
+interface CachedDecision {
+	keepCall: number;
+	keepResult: number;
+}
+
+function hash(text: string): string {
+	let value = 0x81_1c_9d_c5;
+	for (let index = 0; index < text.length; index += 1) {
+		value ^= text.charCodeAt(index);
+		value = Math.imul(value, 0x01_00_01_93) >>> 0;
+	}
+	return value.toString(36);
+}
+
+/** Runs `fn` over `items` with at most `limit` in flight, preserving order. */
+async function mapWithConcurrency<T, R>(
+	items: readonly T[],
+	limit: number,
+	fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+	const results = new Array<R>(items.length);
+	let next = 0;
+	const worker = async (): Promise<void> => {
+		while (true) {
+			const index = next;
+			next += 1;
+			if (index >= items.length) return;
+			results[index] = await fn(items[index]);
+		}
+	};
+	await Promise.all(Array.from({ length: Math.min(Math.max(1, limit), items.length) }, worker));
+	return results;
+}
+
+function cacheKeyFor(call: ToolCall, messages: readonly JevMessage[]): string {
+	const callMessage = messages[call.callIndex];
+	const resultMessage = messages[call.resultIndex];
+	const input = callMessage?.toolUses.find((use) => use.tool_use_id === call.tool_use_id)?.input;
+	const result = resultMessage?.toolResults?.find((res) => res.tool_use_id === call.tool_use_id);
+	return `${call.tool_use_id}|${hash(JSON.stringify(input ?? {}))}|${hash(result?.text ?? "")}`;
+}
+
+/** Jev-backed, cache-backed pruner over pi messages. Pure except for the asker. */
+export class JevPruner {
+	#asker: JevAsker;
+	#options: PruneConfig;
+	#cache = new Map<string, CachedDecision>();
+	#requests = 0;
+	#failures = 0;
+	#windowedRuns = 0;
+	#lastError: string | undefined;
+	#lastAttemptAt = 0;
+
+	constructor(asker: JevAsker, options: PruneOptions = {}) {
+		this.#asker = asker;
+		const defined = Object.fromEntries(
+			Object.entries(options).filter(([, value]) => value !== undefined),
+		) as PruneOptions;
+		this.#options = {
+			...resolveOptions(defined),
+			triggerFraction: defined.triggerFraction ?? DEFAULT_CONFIG.triggerFraction,
+			minNewCalls: defined.minNewCalls ?? DEFAULT_CONFIG.minNewCalls,
+			minPendingChars: defined.minPendingChars ?? DEFAULT_CONFIG.minPendingChars,
+			minIntervalMs: defined.minIntervalMs ?? DEFAULT_CONFIG.minIntervalMs,
+			timeoutMs: defined.timeoutMs ?? DEFAULT_CONFIG.timeoutMs,
+			fallbackWindowMessages: defined.fallbackWindowMessages ?? DEFAULT_CONFIG.fallbackWindowMessages,
+			requestConcurrency: defined.requestConcurrency ?? DEFAULT_CONFIG.requestConcurrency,
+		};
+	}
+
+	get cacheSize(): number {
+		return this.#cache.size;
+	}
+
+	get requests(): number {
+		return this.#requests;
+	}
+
+	/** Failed Jev requests (timeout, HTTP error, malformed answer). */
+	get failures(): number {
+		return this.#failures;
+	}
+
+	/** Prunes whose state only covered the fallback window. */
+	get windowedRuns(): number {
+		return this.#windowedRuns;
+	}
+
+	/** Message of the most recent failure, for diagnostics. */
+	get lastError(): string | undefined {
+		return this.#lastError;
+	}
+
+	clearCache(): void {
+		this.#cache.clear();
+	}
+
+	async prune(
+		messages: readonly PiMessage[],
+		controls: PruneControls = { allowNetwork: true },
+	): Promise<PruneOutcome | null> {
+		const started = Date.now();
+		const charsBefore = JSON.stringify(messages).length;
+		const jevMessages = toJevMessages(messages);
+		const calls = collectToolCalls(jevMessages, this.#options.preserveRecentMessages);
+		if (calls.length === 0) return null;
+
+		const keys = new Map<string, string>();
+		const pending: ToolCall[] = [];
+		const resolved = new Map<string, CachedDecision>();
+		for (const call of calls) {
+			const key = cacheKeyFor(call, jevMessages);
+			keys.set(call.id, key);
+			const cached = this.#cache.get(key);
+			if (call.pinned) {
+				resolved.set(call.id, { keepCall: 1, keepResult: 1 });
+			} else if (cached) {
+				resolved.set(call.id, cached);
+			} else {
+				pending.push(call);
+			}
+		}
+
+		const pendingChars = pending.reduce((sum, call) => sum + call.resultChars, 0);
+		const intervalElapsed = Date.now() - this.#lastAttemptAt >= this.#options.minIntervalMs;
+		const enough =
+			pending.length >= Math.max(1, this.#options.minNewCalls) &&
+			pendingChars >= this.#options.minPendingChars &&
+			intervalElapsed;
+		const wantNetwork = controls.allowNetwork && pending.length > 0 && (enough || controls.urgent === true);
+
+		let scored = { requests: 0, stateTokens: 0, windowed: false };
+		if (wantNetwork) {
+			// Recorded before the call so a hanging or failing Jev is retried at most
+			// once per interval instead of on every LLM request.
+			this.#lastAttemptAt = Date.now();
+			scored = await this.#scorePending(jevMessages, calls, pending, resolved);
+			if (scored.windowed) this.#windowedRuns += 1;
+		}
+
+		const decisions: PruneDecision[] = calls.map((call) => {
+			const key = keys.get(call.id) ?? call.tool_use_id;
+			const answer = resolved.get(call.id);
+			if (!answer) {
+				// Never scored (network skipped or failed): keep, and leave uncached
+				// so the next eligible turn can still ask about this call.
+				return {
+					...decideCall(call, { keepCall: 1, keepResult: 1 }, this.#options),
+					toolUseId: call.tool_use_id,
+				};
+			}
+			if (!call.pinned) this.#cache.set(key, answer);
+			return {
+				...decideCall(call, { keepCall: answer.keepCall, keepResult: answer.keepResult }, this.#options),
+				toolUseId: call.tool_use_id,
+			};
+		});
+
+		const applied = applyDecisions(messages, decisions, this.#options.truncateHeadChars, pairedIds(calls));
+		if (!applied) return null;
+
+		const charsAfter = JSON.stringify(applied).length;
+		return {
+			messages: applied,
+			decisions,
+			stats: {
+				calls: calls.length,
+				kept: decisions.filter((decision) => decision.action === "keep").length,
+				resultsDropped: decisions.filter((decision) => decision.action === "drop_result").length,
+				callsDropped: decisions.filter((decision) => decision.action === "drop_call").length,
+				pinned: calls.filter((call) => call.pinned).length,
+				charsBefore,
+				charsAfter,
+				requests: scored.requests,
+				stateTokens: scored.stateTokens,
+				windowed: scored.windowed,
+				ms: Date.now() - started,
+			},
+		};
+	}
+
+	/**
+	 * Asks Jev about the pending calls and fills `resolved`; returns the number of
+	 * HTTP requests, the fitted state size and whether the state had to be windowed.
+	 *
+	 * The state is the whole conversation. When even the fully truncated history is
+	 * too big for `maxStateTokens` — a long session with hundreds of tool calls hits
+	 * this floor — the state is rebuilt from the newest `fallbackWindowMessages`
+	 * messages instead, so pruning keeps working (at reduced context) rather than
+	 * switching itself off in exactly the sessions that need it.
+	 */
+	async #scorePending(
+		jevMessages: readonly JevMessage[],
+		calls: readonly ToolCall[],
+		pending: readonly ToolCall[],
+		resolved: Map<string, CachedDecision>,
+	): Promise<{ requests: number; stateTokens: number; windowed: boolean }> {
+		const pendingByToolUseId = new Map(pending.map((call) => [call.tool_use_id, call]));
+		let state: JevState;
+		let stateTokens: number;
+		let batches: ToolCall[][];
+		let windowed = false;
+		try {
+			const fittedState = fitState(jevMessages, calls, this.#options);
+			state = fittedState.state;
+			stateTokens = fittedState.tokens;
+			batches = batchCalls(pending, fittedState.tokens, this.#options);
+		} catch (fitError) {
+			const window = this.#options.fallbackWindowMessages;
+			const windowedMessages = window > 0 ? jevMessages.slice(-window) : [];
+			const windowedCalls = collectToolCalls(windowedMessages, 0).filter((call) => !call.pinned);
+			if (windowedCalls.length === 0) {
+				this.#recordFailure(fitError); // cannot be fitted at all: keep all, retry later
+				return { requests: 0, stateTokens: 0, windowed: false };
+			}
+			try {
+				const fittedState = fitState(windowedMessages, windowedCalls, this.#options);
+				state = fittedState.state;
+				stateTokens = fittedState.tokens;
+				batches = batchCalls(windowedCalls, fittedState.tokens, this.#options);
+				windowed = true;
+			} catch (windowError) {
+				this.#recordFailure(windowError);
+				return { requests: 0, stateTokens: 0, windowed: false };
+			}
+		}
+
+		let requests = 0;
+		await mapWithConcurrency(batches, this.#options.requestConcurrency, async (batch) => {
+			const questions = Object.assign({}, ...batch.map(questionsFor));
+			try {
+				const response = await this.#asker.ask(state, questions);
+				this.#requests += 1;
+				requests += 1;
+				for (const asked of batch) {
+					// In the windowed case the asked call carries a different positional id;
+					// decisions are keyed by the pending call, i.e. by tool-call id.
+					const target = pendingByToolUseId.get(asked.tool_use_id);
+					if (!target) continue;
+					resolved.set(target.id, {
+						keepCall: noulAnswer(response.answers, `call_${asked.id}`),
+						keepResult: noulAnswer(response.answers, `result_${asked.id}`),
+					});
+				}
+			} catch (error) {
+				// Leave this batch unscored: those calls stay verbatim, uncached.
+				this.#recordFailure(error);
+			}
+		});
+		return { requests, stateTokens, windowed };
+	}
+
+	#recordFailure(error: unknown): void {
+		this.#failures += 1;
+		this.#lastError = messageReason(error);
+	}
+}
+
+/* -------------------------------------------------- applying the decisions */
+
+function truncatedResultContent(text: string, isError: boolean, headChars: number): string {
+	if (text.length === 0) return "[fast-jev-compaction removed an empty tool result]";
+	if (text.length <= headChars + 120) return text;
+	const head = headChars > 0 ? `${text.slice(0, headChars)}\n` : "";
+	return `${head}[fast-jev-compaction truncated ${text.length - headChars} chars of this tool result${
+		isError ? " (error)" : ""
+	}; re-run the tool if needed]`;
+}
+
+/** The tool-use ids that had a matching result in the input messages. */
+function pairedIds(calls: readonly ToolCall[]): Set<string> {
+	return new Set(calls.map((call) => call.tool_use_id));
+}
+
+/**
+ * Rewrites pi messages from Jev decisions. Returns null when the result would
+ * break the tool-call/tool-result pairing providers require, in which case the
+ * caller keeps the original messages.
+ */
+export function applyDecisions(
+	messages: readonly PiMessage[],
+	decisions: readonly PruneDecision[],
+	truncateHeadChars: number,
+	paired: ReadonlySet<string>,
+): PiMessage[] | null {
+	const actionOf = new Map<string, CallDecision["action"]>();
+	for (const decision of decisions) {
+		if (decision.action === "keep") continue;
+		actionOf.set(decision.toolUseId, decision.action);
+	}
+	if (actionOf.size === 0) return null;
+
+	const output: PiMessage[] = [];
+	for (const message of messages) {
+		if (message.role === "toolResult") {
+			const id = String(message.toolCallId ?? "");
+			const action = actionOf.get(id);
+			if (action === "drop_call") continue;
+			if (action === "drop_result") {
+				const text = truncatedResultContent(resultText(message), message.isError === true, truncateHeadChars);
+				const rewritten: PiMessage = {
+					...message,
+					content: text.length > 0 ? [{ type: "text", text }] : [],
+				};
+				delete rewritten.details;
+				output.push(rewritten);
+				continue;
+			}
+			output.push(message);
+			continue;
+		}
+
+		const parts = asParts(message.content);
+		if (message.role !== "assistant" || parts.length === 0) {
+			output.push(message);
+			continue;
+		}
+		const kept = parts.filter(
+			(part) =>
+				part.type !== "toolCall" || !actionOf.has(String(part.id ?? "")) ||
+				actionOf.get(String(part.id ?? "")) !== "drop_call",
+		);
+		if (kept.length === parts.length) {
+			output.push(message);
+			continue;
+		}
+		const rewritten: PiMessage = { ...message, content: kept };
+		if (kept.length === 0) {
+			rewritten.content = [{ type: "text", text: "[fast-jev-compaction removed stale tool call(s)]" }];
+		}
+		if (rewritten.stopReason === "toolUse" && kept.every((part) => part.type !== "toolCall")) {
+			rewritten.stopReason = "stop";
+		}
+		output.push(rewritten);
+	}
+
+	if (!pairingIntact(output, paired)) return null;
+	return output;
+}
+
+/**
+ * No new orphan may be introduced: every paired call that survives still has
+ * its result, and every surviving result still has its call. Tool calls that
+ * were already unpaired in the input are left alone.
+ */
+function pairingIntact(messages: readonly PiMessage[], paired: ReadonlySet<string>): boolean {
+	const calls = new Set<string>();
+	const results = new Set<string>();
+	for (const message of messages) {
+		if (message.role === "assistant") {
+			for (const part of toolCallParts(message)) calls.add(String(part.id ?? ""));
+		} else if (message.role === "toolResult") {
+			results.add(String(message.toolCallId ?? ""));
+		}
+	}
+	for (const id of paired) {
+		if (calls.has(id) !== results.has(id)) return false;
+	}
+	return true;
+}
+
+/* ------------------------------------------------------------- extension */
+
+interface PrunerState {
+	config: FastJevConfig;
+	pruner: JevPruner | undefined;
+	apiKey: string | undefined;
+	lastStatus: string | undefined;
+	warnedMissingKey: boolean;
+	notifiedFailures: number;
+	notifiedWindowed: boolean;
+}
+
+function buildPruner(config: FastJevConfig, apiKey: string): JevPruner {
+	const asker = new HttpJevAsker({
+		apiKey,
+		model: config.model,
+		baseUrl: config.baseUrl,
+		timeoutMs: config.timeoutMs,
+	});
+	return new JevPruner(asker, {
+		keepThreshold: config.keepThreshold,
+		preserveRecentMessages: config.preserveRecentMessages,
+		maxStateTokens: config.maxStateTokens,
+		maxRequestTokens: config.maxRequestTokens,
+		truncateHeadChars: config.truncateHeadChars,
+		triggerFraction: config.triggerFraction,
+		minNewCalls: config.minNewCalls,
+		minIntervalMs: config.minIntervalMs,
+		timeoutMs: config.timeoutMs,
+	});
+}
+
+function formatStats(outcome: PruneOutcome): string {
+	const { stats } = outcome;
+	const saved = stats.charsBefore - stats.charsAfter;
+	return `jev: ${stats.callsDropped} call(s) + ${stats.resultsDropped} result(s) dropped, ${stats.kept} kept, ~${saved} chars saved (${stats.requests} request(s), ${stats.ms}ms)`;
+}
+
+/** Short one-liner for the footer status. */
+function formatStatus(outcome: PruneOutcome): string {
+	const { stats } = outcome;
+	const saved = Math.round((stats.charsBefore - stats.charsAfter) / 100) / 10;
+	return `jev: -${saved}k ch, ${stats.callsDropped}+${stats.resultsDropped} dropped, ${stats.requests} req${stats.windowed ? " [window]" : ""}`;
+}
+
+export default function fastJevCompaction(pi: ExtensionAPI): void {
+	const state: PrunerState = {
+		config: loadConfig(),
+		pruner: undefined,
+		apiKey: undefined,
+		lastStatus: undefined,
+		warnedMissingKey: false,
+		notifiedFailures: 0,
+		notifiedWindowed: false,
+	};
+
+	const ensurePruner = (ctx: ExtensionContext): JevPruner | undefined => {
+		if (!state.config.enabled) return undefined;
+		if (!state.pruner || !state.apiKey) {
+			state.apiKey = resolveApiKey(state.config);
+			if (!state.apiKey) {
+				if (!state.warnedMissingKey && state.config.notify) {
+					state.warnedMissingKey = true;
+					ctx.ui.notify(
+						"fast-jev-compaction: no API key (set FAST_JEV_API_KEY or JEV_API_KEY); context left untouched",
+						"warning",
+					);
+				}
+				return undefined;
+			}
+			state.pruner = buildPruner(state.config, state.apiKey);
+			if (state.config.notify) {
+				if (keyFileIsLoose()) {
+					ctx.ui.notify(
+						`fast-jev-compaction: ${keyPath()} is readable by other users (chmod 600 it)`,
+						"warning",
+					);
+				}
+				ctx.ui.setStatus("fast-jev", "jev: armed");
+			}
+		}
+		return state.pruner;
+	};
+
+	pi.on("context", async (event, ctx) => {
+		const pruner = ensurePruner(ctx);
+		if (!pruner) return;
+
+		const usage = ctx.getContextUsage();
+		const window = usage?.contextWindow ?? 0;
+		const used = usage?.tokens ?? estimateTokens(JSON.stringify(event.messages));
+		const trigger = window > 0 ? window * state.config.triggerFraction : Number.POSITIVE_INFINITY;
+		const allowNetwork = used >= trigger;
+		const urgent = window > 0 && used >= window * 0.85;
+
+		let outcome: PruneOutcome | null;
+		try {
+			outcome = await pruner.prune(event.messages as unknown as PiMessage[], { allowNetwork, urgent });
+		} catch (error) {
+			ctx.ui.notify(`fast-jev-compaction: ${messageReason(error)}`, "error");
+			return;
+		}
+		if (!outcome) return;
+
+		if (state.config.notify && pruner.failures > state.notifiedFailures) {
+			state.notifiedFailures = pruner.failures;
+			ctx.ui.notify(
+				`fast-jev-compaction: Jev request failed (${pruner.lastError ?? "unknown"}); context kept verbatim`,
+				"warning",
+			);
+		}
+
+		if (state.config.notify && pruner.windowedRuns > 0 && !state.notifiedWindowed) {
+			state.notifiedWindowed = true;
+			ctx.ui.notify(
+				`fast-jev-compaction: history too large for the full state, scoring against the last ${state.config.fallbackWindowMessages} messages`,
+				"warning",
+			);
+		}
+
+		if (state.config.notify && outcome.stats.requests > 0) {
+			const line = formatStats(outcome);
+			state.lastStatus = line;
+			ctx.ui.setStatus("fast-jev", formatStatus(outcome));
+		}
+		return { messages: outcome.messages as unknown as typeof event.messages };
+	});
+
+	pi.registerCommand("jev-compaction", {
+		description: "fast-jev-compaction: status, on/off, clear cache, live probe",
+		handler: async (args, ctx) => {
+			const command = (args ?? "").trim().toLowerCase();
+			if (command === "on" || command === "off") {
+				state.config.enabled = command === "on";
+				if (state.config.enabled) state.pruner = undefined;
+				ctx.ui.notify(`fast-jev-compaction ${command}`, "info");
+				return;
+			}
+			if (command === "clear") {
+				state.pruner?.clearCache();
+				ctx.ui.notify("fast-jev-compaction: decision cache cleared", "info");
+				return;
+			}
+			if (command === "probe") {
+				const apiKey = resolveApiKey(state.config);
+				if (!apiKey) {
+					ctx.ui.notify("fast-jev-compaction: no API key configured", "warning");
+					return;
+				}
+				const asker = new HttpJevAsker({
+					apiKey,
+					model: state.config.model,
+					baseUrl: state.config.baseUrl,
+					timeoutMs: state.config.timeoutMs,
+				});
+				try {
+					const response = await asker.ask({ probe: "pi fast-jev-compaction" }, {
+						probe: {
+							type: "noul",
+							instructions: "Does this request come from a pi coding-agent session?",
+						},
+					});
+					const answer = noulAnswer(response.answers, "probe");
+					ctx.ui.notify(`fast-jev-compaction: probe ok (p=${answer.toFixed(2)}, model ${response.model ?? "?"})`, "info");
+				} catch (error) {
+					ctx.ui.notify(`fast-jev-compaction: probe failed — ${messageReason(error)}`, "error");
+				}
+				return;
+			}
+			const pruner = state.pruner;
+			ctx.ui.notify(
+				[
+					`fast-jev-compaction: ${state.config.enabled ? "enabled" : "disabled"}`,
+					`key: ${resolveApiKey(state.config) ? "configured" : "missing"}`,
+					`trigger: ${(state.config.triggerFraction * 100).toFixed(0)}% of window`,
+					`min new calls/requests: ${state.config.minNewCalls}/${state.config.minIntervalMs}ms`,
+					`cached decisions: ${pruner?.cacheSize ?? 0}, requests this session: ${pruner?.requests ?? 0}${pruner?.failures ? `, ${pruner.failures} failed` : ""}${pruner?.windowedRuns ? `, ${pruner.windowedRuns} windowed` : ""}`,
+					...(pruner?.lastError ? [`last error: ${pruner.lastError}`] : []),
+					state.lastStatus ?? "last prune: none",
+					`config: ${configPath()}`,
+					`key file: ${keyPath()}${keyFileIsLoose() ? " (readable by other users)" : ""}`,
+				].join("\n"),
+				"info",
+			);
+		},
+	});
+
+	pi.on("session_shutdown", () => {
+		state.pruner?.clearCache();
+		state.pruner = undefined;
+		state.apiKey = undefined;
+	});
+}
