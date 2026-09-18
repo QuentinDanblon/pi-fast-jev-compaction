@@ -158,16 +158,24 @@ export const DEFAULT_READ_ONLY_TOOLS = ["read", "grep", "find", "ls", "glob"];
 const DEFAULT_TRIGGER_FRACTION = 0.5;
 
 /**
- * Fewest LLM calls between two pruning events.
+ * Fewest LLM calls between two pruning events — the cache-cost gate.
  *
- * Every newly dropped call changes the prompt prefix, so the cached suffix has to be
- * written again instead of being read. Writing costs ~10x reading on the usual pricing
- * (Anthropic, DeepSeek), and a prune frees `f` of the context (measured ~0.3), so one
- * invalidation only pays off when more than ~(write/read - 1) / f ≈ 30 further calls
- * will still be sent with the shrunken context. Fewer, larger prunes beat continuous
- * trimming; the 85% "urgent" path still bypasses this.
+ * Removing an old call rewrites the prompt prefix, so the whole cached suffix becomes a
+ * cache **write** instead of a cheap **read** (roughly 10x the price on Anthropic and
+ * DeepSeek pricing, so 9 extra read-equivalents per rewritten token). A prune that frees a
+ * fraction `f` of the prompt only pays for itself after
+ *
+ *     (write/read - 1) / f   further LLM calls
+ *
+ * With the default safe rules `f` is measured around 0.11 (results only, calls kept), which
+ * puts the break-even near 80 calls. With whole calls deletable (`f` ~ 0.3) it drops to ~30.
+ * Fewer, larger prunes beat continuous trimming; the 85 % "urgent" path bypasses this when
+ * the window really fills, because a full window is worse than an invalidation.
+ *
+ * On a flat-rate or subscription provider that does not bill cache writes separately, this
+ * gate only costs context relief and can be lowered.
  */
-const DEFAULT_MIN_CALLS_BETWEEN_PRUNES = 30;
+const DEFAULT_MIN_CALLS_BETWEEN_PRUNES = 80;
 
 /** Characters of each pending result handed to Jev inside the question (300 ≈ a stack trace head). */
 const DEFAULT_STATE_RESULT_HEAD_CHARS = 300;

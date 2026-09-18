@@ -104,7 +104,7 @@ The footer shows a one-line summary when a prune happens:
   "minNewCalls": 2,
   "minPendingChars": 2000,
   "minIntervalMs": 5000,
-  "minCallsBetweenPrunes": 30,
+  "minCallsBetweenPrunes": 80,
   "fallbackWindowMessages": 120,
   "requestConcurrency": 4,
   "stateResultHeadChars": 300,
@@ -149,12 +149,15 @@ Cost control — the state is re-sent every request, so a round-trip must be wor
   characters, and when `minIntervalMs` has passed since the last attempt — an attempt is
   recorded even when it fails, so a broken key costs one timeout per interval instead of one
   per request;
-- `minCallsBetweenPrunes` (default 30) is the cache-cost gate, and the most important one:
+- `minCallsBetweenPrunes` (default 80) is the cache-cost gate, and the most important one:
   removing an old call rewrites the prompt prefix, so the cached suffix becomes a cache
-  **write** instead of a cheap **read** (roughly 10x the price on Anthropic/DeepSeek pricing).
-  A prune that frees a fraction `f` of the context only pays off after about
-  `(write/read − 1) / f ≈ 30` further LLM calls with the shrunken context. Fewer, larger prunes
-  beat continuous trimming;
+  **write** instead of a cheap **read** (~10x the price on Anthropic/DeepSeek pricing, i.e. 9
+  extra read-equivalents per rewritten token). A prune that frees a fraction `f` of the prompt
+  only pays for itself after `(write/read − 1) / f` further LLM calls. With the safe defaults
+  `f` is measured at ~0.11, which puts break-even near **80 calls**; with whole calls deletable
+  (`f` ~ 0.3) it drops to ~30. Fewer, larger prunes beat continuous trimming. On a flat-rate or
+  subscription provider that does not bill cache writes separately, this gate only costs
+  context relief and can be lowered;
 - above 85 % of the window all of that is bypassed (`urgent`), because a full window is worse
   than an invalidation;
 
