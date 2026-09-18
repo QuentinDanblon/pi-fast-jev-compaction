@@ -32,7 +32,6 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
-	batchCalls,
 	buildJevRequest,
 	collectToolCalls,
 	decideCall,
@@ -87,6 +86,16 @@ export interface FastJevConfig {
 	maxStateTokens?: number;
 	maxRequestTokens?: number;
 	truncateHeadChars?: number;
+	/** Characters of each pending tool result shown to Jev (0 = upstream behaviour). */
+	stateResultHeadChars?: number;
+	/** Fewest LLM calls between two pruning events. */
+	minCallsBetweenPrunes?: number;
+	/** Tools whose calls may be deleted outright (default: read, grep, find, ls, glob). */
+	readOnlyTools?: string[];
+	/** Treat `bash` calls with a provably read-only command as removable (default true). */
+	detectReadOnlyCommands?: boolean;
+	/** Abridge kept-call string arguments longer than this (default 500; 0 = off). */
+	abridgeArgumentChars?: number;
 }
 
 type PruneConfig = ResolvedCompactOptions & {
@@ -94,9 +103,19 @@ type PruneConfig = ResolvedCompactOptions & {
 	minNewCalls: number;
 	minPendingChars: number;
 	minIntervalMs: number;
+	/** Fewest LLM calls between two pruning events (cache invalidation amortisation). */
+	minCallsBetweenPrunes: number;
 	timeoutMs: number;
 	fallbackWindowMessages: number;
 	requestConcurrency: number;
+	/** Characters of each pending result shown to Jev inside the question. */
+	stateResultHeadChars: number;
+	/** Tools whose calls may be removed entirely; any other tool keeps its call. */
+	readOnlyTools: string[];
+	/** Treat `bash` calls with a provably read-only command as removable. */
+	detectReadOnlyCommands: boolean;
+	/** Abridge string arguments longer than this on kept calls (0 = off). */
+	abridgeArgumentChars: number;
 };
 
 export type PruneOptions = Parameters<typeof resolveOptions>[0] &
@@ -107,24 +126,65 @@ export type PruneOptions = Parameters<typeof resolveOptions>[0] &
 			| "minNewCalls"
 			| "minPendingChars"
 			| "minIntervalMs"
+			| "minCallsBetweenPrunes"
 			| "timeoutMs"
 			| "fallbackWindowMessages"
 			| "requestConcurrency"
+			| "stateResultHeadChars"
+			| "readOnlyTools"
+			| "detectReadOnlyCommands"
+			| "abridgeArgumentChars"
 		>
 	>;
+
 /** One decision, tied back to the tool call it scores. */
 export interface PruneDecision extends CallDecision {
 	toolUseId: string;
+	/** Set when a `drop_call` was downgraded to `drop_result` for safety. */
+	downgraded?: "mutating-tool" | "signed-thinking";
 }
+
+/**
+ * Tools whose calls may be deleted outright. Everything else (bash, write, edit,
+ * MCP tools…) keeps its call so the model does not lose the record of what it
+ * already tried, which is how "stupid loops" start.
+ */
+export const DEFAULT_READ_ONLY_TOOLS = ["read", "grep", "find", "ls", "glob"];
+
+/**
+ * Asked above this share of the window. The size gate only decides whether pruning
+ * helps per turn; whether it *pays* is decided by `minCallsBetweenPrunes`, see below.
+ */
+const DEFAULT_TRIGGER_FRACTION = 0.5;
+
+/**
+ * Fewest LLM calls between two pruning events.
+ *
+ * Every newly dropped call changes the prompt prefix, so the cached suffix has to be
+ * written again instead of being read. Writing costs ~10x reading on the usual pricing
+ * (Anthropic, DeepSeek), and a prune frees `f` of the context (measured ~0.3), so one
+ * invalidation only pays off when more than ~(write/read - 1) / f ≈ 30 further calls
+ * will still be sent with the shrunken context. Fewer, larger prunes beat continuous
+ * trimming; the 85% "urgent" path still bypasses this.
+ */
+const DEFAULT_MIN_CALLS_BETWEEN_PRUNES = 30;
+
+/** Characters of each pending result handed to Jev inside the question (300 ≈ a stack trace head). */
+const DEFAULT_STATE_RESULT_HEAD_CHARS = 300;
 
 const DEFAULT_CONFIG: Omit<FastJevConfig, "apiKey"> = {
 	enabled: true,
-	triggerFraction: 0.5,
+	triggerFraction: DEFAULT_TRIGGER_FRACTION,
 	minNewCalls: 2,
 	minPendingChars: 2_000,
 	minIntervalMs: 5_000,
+	minCallsBetweenPrunes: DEFAULT_MIN_CALLS_BETWEEN_PRUNES,
 	fallbackWindowMessages: 120,
 	requestConcurrency: 4,
+	stateResultHeadChars: DEFAULT_STATE_RESULT_HEAD_CHARS,
+	readOnlyTools: DEFAULT_READ_ONLY_TOOLS,
+	detectReadOnlyCommands: true,
+	abridgeArgumentChars: 500,
 	notify: true,
 	model: "jev-latest",
 	baseUrl: "https://api.typesafe.ai/v1/systemone",
@@ -359,6 +419,10 @@ export function toJevMessages(messages: readonly PiMessage[]): JevMessage[] {
 	});
 }
 
+function assistantHasThinking(message: PiMessage | undefined): boolean {
+	return message !== undefined && asParts(message.content).some((part) => part.type === "thinking");
+}
+
 /* ------------------------------------------------------------- the pruner */
 
 export interface PruneOutcome {
@@ -369,6 +433,10 @@ export interface PruneOutcome {
 		kept: number;
 		resultsDropped: number;
 		callsDropped: number;
+		/** `drop_call` downgraded to `drop_result` by the safety rules. */
+		downgraded: number;
+		/** Long arguments of kept calls that were abridged. */
+		abridgedArgs: number;
 		pinned: number;
 		charsBefore: number;
 		charsAfter: number;
@@ -421,6 +489,129 @@ async function mapWithConcurrency<T, R>(
 	return results;
 }
 
+/** A safe head of each result, so Jev judges content it can actually read. */
+function resultHeads(
+	messages: readonly JevMessage[],
+	calls: readonly ToolCall[],
+	headChars: number,
+): Map<string, string> {
+	const heads = new Map<string, string>();
+	if (headChars <= 0) return heads;
+	for (const call of calls) {
+		const text =
+			messages[call.resultIndex]?.toolResults?.find((result) => result.tool_use_id === call.tool_use_id)?.text ?? "";
+		heads.set(call.tool_use_id, text.slice(0, headChars));
+	}
+	return heads;
+}
+
+/**
+ * The two questions asked about one call. The result question carries the head of
+ * the result, because upstream's state replaces every result with `n chars
+ * (omitted)` — which asks Jev to judge usefulness from the length alone.
+ */
+export function buildQuestions(call: ToolCall, resultHead: string): JevQuestions {
+	const questions = questionsFor(call);
+	const key = `result_${call.id}`;
+	const question = questions[key];
+	if (!question || resultHead.length === 0) return questions;
+	const truncated = resultHead.length < call.resultChars;
+	return {
+		...questions,
+		[key]: {
+			...question,
+			instructions: `${question.instructions}\nIts output begins: ${resultHead}${
+				truncated ? ` … (${call.resultChars} characters in total)` : ""
+			}`,
+		},
+	};
+}
+
+/** Tokens the request envelope (`model`, key names) adds around state and questions. */
+const REQUEST_OVERHEAD_TOKENS = 20;
+
+/**
+ * Splits candidate calls into batches whose questions fit one request together with
+ * the (always complete) state. Upstream's `batchCalls` cannot be used here: it prices
+ * questions built without the result heads, which would overflow Jev's 32k ceiling.
+ */
+export function batchCallsWith(
+	calls: readonly ToolCall[],
+	stateTokens: number,
+	maxRequestTokens: number,
+	questionsOf: (call: ToolCall) => JevQuestions,
+): ToolCall[][] {
+	const budget = maxRequestTokens - stateTokens - REQUEST_OVERHEAD_TOKENS;
+	const batches: ToolCall[][] = [];
+	let current: ToolCall[] = [];
+	let currentTokens = 0;
+	for (const call of calls) {
+		const tokens = estimateTokens(JSON.stringify(questionsOf(call)));
+		if (current.length > 0 && currentTokens + tokens > budget) {
+			batches.push(current);
+			current = [];
+			currentTokens = 0;
+		}
+		if (current.length === 0 && tokens > budget) {
+			throw new Error(
+				`state leaves no room for questions (~${stateTokens} of ${maxRequestTokens} tokens)`,
+			);
+		}
+		current.push(call);
+		currentTokens += tokens;
+	}
+	if (current.length > 0) batches.push(current);
+	return batches;
+}
+
+/**
+ * Shell commands that cannot change anything: safe to drop the whole call, because
+ * re-running them is free. Anything else (installs, migrations, writes, deploys) keeps
+ * its call so the model does not lose the record of what it already tried.
+ */
+const READ_ONLY_COMMANDS = new Set([
+	"basename", "cat", "cd", "cut", "date", "df", "diff", "dirname", "du", "echo", "env", "file",
+	"find", "grep", "head", "ls", "printenv", "pwd", "readlink", "realpath", "rg", "sort", "stat",
+	"tail", "tree", "tr", "uniq", "wc", "which", "whoami",
+]);
+
+// `branch`, `tag` and `remote` are deliberately absent: they mutate when given arguments.
+const READ_ONLY_GIT_SUBCOMMANDS = new Set([
+	"blame", "describe", "diff", "log", "ls-files", "rev-parse", "shortlog", "show", "status",
+]);
+
+const READ_ONLY_PACKAGE_SUBCOMMANDS = new Set(["ls", "list", "outdated", "view", "why"]);
+
+function isReadOnlySegment(segment: string): boolean {
+	const tokens = segment.trim().split(/\s+/).filter((token) => token.length > 0);
+	if (tokens.length === 0) return false;
+	// Leading VAR=value assignments are fine.
+	let index = 0;
+	while (index < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index])) index += 1;
+	const command = tokens[index]?.replace(/^.*[\\/]/, "");
+	if (command === undefined) return false;
+	const sub = tokens[index + 1];
+	if (command === "git") return sub !== undefined && READ_ONLY_GIT_SUBCOMMANDS.has(sub);
+	if (["npm", "pnpm", "yarn", "bun"].includes(command)) {
+		return sub !== undefined && READ_ONLY_PACKAGE_SUBCOMMANDS.has(sub);
+	}
+	if (["npx", "tsx", "tsc"].includes(command)) return false;
+	return READ_ONLY_COMMANDS.has(command);
+}
+
+/**
+ * True when a shell command provably only reads: every `|`/`&&`/`;`/`||` segment starts
+ * with a read-only command, with no redirect, command substitution or background job.
+ */
+export function isReadOnlyCommand(command: string): boolean {
+	if (command.trim().length === 0) return false;
+	if (/[<>`]|\$\(|\$\{/.test(command)) return false; // redirect or substitution
+	if (/(^|[^|&])&($|[^&])/.test(command)) return false; // background job
+	if (/(^|\s)-i(\s|$|=)/.test(command)) return false; // in-place edit (sed -i, perl -i)
+	const segments = command.split(/\|\||&&|\||;/);
+	return segments.every((segment) => isReadOnlySegment(segment));
+}
+
 function cacheKeyFor(call: ToolCall, messages: readonly JevMessage[]): string {
 	const callMessage = messages[call.callIndex];
 	const resultMessage = messages[call.resultIndex];
@@ -451,9 +642,15 @@ export class JevPruner {
 			minNewCalls: defined.minNewCalls ?? DEFAULT_CONFIG.minNewCalls,
 			minPendingChars: defined.minPendingChars ?? DEFAULT_CONFIG.minPendingChars,
 			minIntervalMs: defined.minIntervalMs ?? DEFAULT_CONFIG.minIntervalMs,
+			minCallsBetweenPrunes:
+				defined.minCallsBetweenPrunes ?? DEFAULT_MIN_CALLS_BETWEEN_PRUNES,
 			timeoutMs: defined.timeoutMs ?? DEFAULT_CONFIG.timeoutMs,
 			fallbackWindowMessages: defined.fallbackWindowMessages ?? DEFAULT_CONFIG.fallbackWindowMessages,
 			requestConcurrency: defined.requestConcurrency ?? DEFAULT_CONFIG.requestConcurrency,
+			stateResultHeadChars: defined.stateResultHeadChars ?? DEFAULT_STATE_RESULT_HEAD_CHARS,
+			readOnlyTools: defined.readOnlyTools ?? DEFAULT_READ_ONLY_TOOLS,
+			detectReadOnlyCommands: defined.detectReadOnlyCommands ?? true,
+			abridgeArgumentChars: defined.abridgeArgumentChars ?? 500,
 		};
 	}
 
@@ -539,24 +736,32 @@ export class JevPruner {
 				};
 			}
 			if (!call.pinned) this.#cache.set(key, answer);
-			return {
+			const decision: PruneDecision = {
 				...decideCall(call, { keepCall: answer.keepCall, keepResult: answer.keepResult }, this.#options),
 				toolUseId: call.tool_use_id,
 			};
+			return this.#applySafetyRules(call, messages, decision);
 		});
 
-		const applied = applyDecisions(messages, decisions, this.#options.truncateHeadChars, pairedIds(calls));
+		const applied = applyDecisions(
+			messages,
+			decisions,
+			this.#options.truncateHeadChars,
+			pairedIds(calls),
+			this.#options.abridgeArgumentChars,
+		);
 		if (!applied) return null;
-
-		const charsAfter = JSON.stringify(applied).length;
+		const charsAfter = JSON.stringify(applied.messages).length;
 		return {
-			messages: applied,
+			messages: applied.messages,
 			decisions,
 			stats: {
 				calls: calls.length,
 				kept: decisions.filter((decision) => decision.action === "keep").length,
 				resultsDropped: decisions.filter((decision) => decision.action === "drop_result").length,
 				callsDropped: decisions.filter((decision) => decision.action === "drop_call").length,
+				downgraded: decisions.filter((decision) => decision.downgraded !== undefined).length,
+				abridgedArgs: applied.abridgedArgs,
 				pinned: calls.filter((call) => call.pinned).length,
 				charsBefore,
 				charsAfter,
@@ -566,6 +771,44 @@ export class JevPruner {
 				ms: Date.now() - started,
 			},
 		};
+	}
+
+	/**
+	 * A call may only be removed outright when removing it is safe:
+	 *
+	 * - re-running the tool must be harmless, so mutating tools (bash, write, edit,
+	 *   MCP…) keep their call and are only truncated — that also preserves the record
+	 *   of what was already tried, which is how the model avoids repeating itself;
+	 * - the assistant message must not carry a thinking block, because rewriting a
+	 *   message that holds a provider-signed reasoning payload invalidates it.
+	 *
+	 * Both cases fall back to `drop_result`: the bulky output goes, the call stays.
+	 */
+	#applySafetyRules(call: ToolCall, messages: readonly PiMessage[], decision: PruneDecision): PruneDecision {
+		if (decision.action !== "drop_call") return decision;
+		const tool = call.tool.toLowerCase();
+		const readOnlyTool = this.#options.readOnlyTools.some((allowed) => allowed.toLowerCase() === tool);
+		if (!readOnlyTool && !this.#isProvablyReadOnlyShellCall(call, messages)) {
+			return { ...decision, action: "drop_result", reason: "result_dropped", downgraded: "mutating-tool" };
+		}
+		if (assistantHasThinking(messages[call.callIndex])) {
+			return { ...decision, action: "drop_result", reason: "result_dropped", downgraded: "signed-thinking" };
+		}
+		return decision;
+	}
+
+	/** `bash` is droppable only when its command is provably read-only. */
+	#isProvablyReadOnlyShellCall(call: ToolCall, messages: readonly PiMessage[]): boolean {
+		if (!this.#options.detectReadOnlyCommands) return false;
+		const tool = call.tool.toLowerCase();
+		if (tool !== "bash" && tool !== "shell" && tool !== "sh") return false;
+		const input = messages[call.callIndex]
+			? toJevMessages([messages[call.callIndex]])[0]?.toolUses.find(
+					(use) => use.tool_use_id === call.tool_use_id,
+				)?.input
+			: undefined;
+		const command = input?.command ?? input?.cmd ?? input?.script;
+		return typeof command === "string" && isReadOnlyCommand(command);
 	}
 
 	/**
@@ -585,15 +828,19 @@ export class JevPruner {
 		resolved: Map<string, CachedDecision>,
 	): Promise<{ requests: number; stateTokens: number; windowed: boolean }> {
 		const pendingByToolUseId = new Map(pending.map((call) => [call.tool_use_id, call]));
+		const headChars = this.#options.stateResultHeadChars;
 		let state: JevState;
 		let stateTokens: number;
 		let batches: ToolCall[][];
+		let questionsOf: (call: ToolCall) => JevQuestions;
 		let windowed = false;
 		try {
 			const fittedState = fitState(jevMessages, calls, this.#options);
 			state = fittedState.state;
 			stateTokens = fittedState.tokens;
-			batches = batchCalls(pending, fittedState.tokens, this.#options);
+			const heads = resultHeads(jevMessages, pending, headChars);
+			questionsOf = (call) => buildQuestions(call, heads.get(call.tool_use_id) ?? "");
+			batches = batchCallsWith(pending, fittedState.tokens, this.#options.maxRequestTokens, questionsOf);
 		} catch (fitError) {
 			const window = this.#options.fallbackWindowMessages;
 			const windowedMessages = window > 0 ? jevMessages.slice(-window) : [];
@@ -606,7 +853,13 @@ export class JevPruner {
 				const fittedState = fitState(windowedMessages, windowedCalls, this.#options);
 				state = fittedState.state;
 				stateTokens = fittedState.tokens;
-				batches = batchCalls(windowedCalls, fittedState.tokens, this.#options);
+				// Heads must come from the same slice: the two call lists number their
+				// calls independently, so they are matched by tool-call id, never by id.
+				const heads = resultHeads(windowedMessages, windowedCalls, headChars);
+				const windowedQuestionsOf = (call: ToolCall) =>
+					buildQuestions(call, heads.get(call.tool_use_id) ?? "");
+				questionsOf = windowedQuestionsOf;
+				batches = batchCallsWith(windowedCalls, fittedState.tokens, this.#options.maxRequestTokens, windowedQuestionsOf);
 				windowed = true;
 			} catch (windowError) {
 				this.#recordFailure(windowError);
@@ -616,7 +869,7 @@ export class JevPruner {
 
 		let requests = 0;
 		await mapWithConcurrency(batches, this.#options.requestConcurrency, async (batch) => {
-			const questions = Object.assign({}, ...batch.map(questionsFor));
+			const questions = Object.assign({}, ...batch.map(questionsOf));
 			try {
 				const response = await this.#asker.ask(state, questions);
 				this.#requests += 1;
@@ -666,12 +919,37 @@ function pairedIds(calls: readonly ToolCall[]): Set<string> {
  * break the tool-call/tool-result pairing providers require, in which case the
  * caller keeps the original messages.
  */
+/**
+ * Abridges the long string arguments of a call whose result is being truncated. The
+ * call and its shape stay (the model keeps the record of what it ran), but a 40 KB file
+ * body or prompt does not have to be re-sent on every later turn: the tool has already
+ * run and its effect is on disk. Returns the part unchanged when nothing is long enough.
+ */
+function abridgeArguments(part: Part, limit: number): [Part, boolean] {
+	const args = part.arguments;
+	if (args === null || typeof args !== "object" || Array.isArray(args)) return [part, false];
+	const next: Record<string, unknown> = {};
+	let changed = false;
+	for (const [key, value] of Object.entries(args as Record<string, unknown>)) {
+		if (typeof value === "string" && value.length > limit) {
+			next[key] =
+				`${value.slice(0, limit)}\n[fast-jev-compaction abridged ${value.length - limit} characters ` +
+				"of this argument; the call already ran]";
+			changed = true;
+		} else {
+			next[key] = value;
+		}
+	}
+	return changed ? [{ ...part, arguments: next }, true] : [part, false];
+}
+
 export function applyDecisions(
 	messages: readonly PiMessage[],
 	decisions: readonly PruneDecision[],
 	truncateHeadChars: number,
 	paired: ReadonlySet<string>,
-): PiMessage[] | null {
+	abridgeArgumentChars: number,
+): { messages: PiMessage[]; abridgedArgs: number } | null {
 	const actionOf = new Map<string, CallDecision["action"]>();
 	for (const decision of decisions) {
 		if (decision.action === "keep") continue;
@@ -679,6 +957,7 @@ export function applyDecisions(
 	}
 	if (actionOf.size === 0) return null;
 
+	let abridgedArgs = 0;
 	const output: PiMessage[] = [];
 	for (const message of messages) {
 		if (message.role === "toolResult") {
@@ -704,12 +983,19 @@ export function applyDecisions(
 			output.push(message);
 			continue;
 		}
-		const kept = parts.filter(
-			(part) =>
-				part.type !== "toolCall" || !actionOf.has(String(part.id ?? "")) ||
-				actionOf.get(String(part.id ?? "")) !== "drop_call",
-		);
-		if (kept.length === parts.length) {
+		// A message carrying a provider-signed thinking block is never modified.
+		const locked = parts.some((part) => part.type === "thinking");
+		const kept = parts.flatMap((part) => {
+			if (part.type !== "toolCall") return [part];
+			const action = actionOf.get(String(part.id ?? ""));
+			if (action === "drop_call") return [];
+			if (action !== "drop_result" || locked || abridgeArgumentChars <= 0) return [part];
+			const [abridged, changed] = abridgeArguments(part, abridgeArgumentChars);
+			if (!changed) return [part];
+			abridgedArgs += 1;
+			return [abridged];
+		});
+		if (kept.length === parts.length && kept.every((part, index) => part === parts[index])) {
 			output.push(message);
 			continue;
 		}
@@ -724,7 +1010,7 @@ export function applyDecisions(
 	}
 
 	if (!pairingIntact(output, paired)) return null;
-	return output;
+	return { messages: output, abridgedArgs };
 }
 
 /**
@@ -758,6 +1044,8 @@ interface PrunerState {
 	warnedMissingKey: boolean;
 	notifiedFailures: number;
 	notifiedWindowed: boolean;
+	/** LLM calls seen since the last prune that asked Jev something. */
+	callsSincePrune: number;
 }
 
 function buildPruner(config: FastJevConfig, apiKey: string): JevPruner {
@@ -783,7 +1071,9 @@ function buildPruner(config: FastJevConfig, apiKey: string): JevPruner {
 function formatStats(outcome: PruneOutcome): string {
 	const { stats } = outcome;
 	const saved = stats.charsBefore - stats.charsAfter;
-	return `jev: ${stats.callsDropped} call(s) + ${stats.resultsDropped} result(s) dropped, ${stats.kept} kept, ~${saved} chars saved (${stats.requests} request(s), ${stats.ms}ms)`;
+	return `jev: ${stats.callsDropped} call(s) + ${stats.resultsDropped} result(s) dropped${
+		stats.downgraded > 0 ? ` (${stats.downgraded} kept for safety)` : ""
+	}, ${stats.kept} kept, ~${saved} chars saved (${stats.requests} request(s), ${stats.ms}ms)`;
 }
 
 /** Short one-liner for the footer status. */
@@ -802,6 +1092,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
 		warnedMissingKey: false,
 		notifiedFailures: 0,
 		notifiedWindowed: false,
+		callsSincePrune: Number.POSITIVE_INFINITY,
 	};
 
 	const ensurePruner = (ctx: ExtensionContext): JevPruner | undefined => {
@@ -840,8 +1131,15 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
 		const window = usage?.contextWindow ?? 0;
 		const used = usage?.tokens ?? estimateTokens(JSON.stringify(event.messages));
 		const trigger = window > 0 ? window * state.config.triggerFraction : Number.POSITIVE_INFINITY;
-		const allowNetwork = used >= trigger;
+		// A prune rewrites the prompt prefix, so the cached suffix becomes a cache write
+		// (roughly 10x the price of a read). One prune therefore has to be amortised over
+		// enough further calls: see DEFAULT_MIN_CALLS_BETWEEN_PRUNES.
 		const urgent = window > 0 && used >= window * 0.85;
+		state.callsSincePrune += 1;
+		const minCallsBetweenPrunes =
+			state.config.minCallsBetweenPrunes ?? DEFAULT_MIN_CALLS_BETWEEN_PRUNES;
+		const allowNetwork =
+			used >= trigger && (state.callsSincePrune >= minCallsBetweenPrunes || urgent);
 
 		let outcome: PruneOutcome | null;
 		try {
@@ -850,6 +1148,7 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
 			ctx.ui.notify(`fast-jev-compaction: ${messageReason(error)}`, "error");
 			return;
 		}
+		if (outcome && outcome.stats.requests > 0) state.callsSincePrune = 0;
 		if (!outcome) return;
 
 		if (state.config.notify && pruner.failures > state.notifiedFailures) {
@@ -917,13 +1216,18 @@ export default function fastJevCompaction(pi: ExtensionAPI): void {
 				}
 				return;
 			}
+			const minCallsBetweenPrunes =
+				state.config.minCallsBetweenPrunes ?? DEFAULT_MIN_CALLS_BETWEEN_PRUNES;
 			const pruner = state.pruner;
 			ctx.ui.notify(
 				[
 					`fast-jev-compaction: ${state.config.enabled ? "enabled" : "disabled"}`,
 					`key: ${resolveApiKey(state.config) ? "configured" : "missing"}`,
 					`trigger: ${(state.config.triggerFraction * 100).toFixed(0)}% of window`,
+					`may be dropped outright: ${(state.config.readOnlyTools ?? DEFAULT_READ_ONLY_TOOLS).join(", ") || "(nothing)"}; other tools keep their call`,
+					`result head shown to Jev: ${state.config.stateResultHeadChars} chars`,
 					`min new calls/requests: ${state.config.minNewCalls}/${state.config.minIntervalMs}ms`,
+					`calls between prunes: ${minCallsBetweenPrunes} (${Number.isFinite(state.callsSincePrune) ? state.callsSincePrune : "-"} since the last one)`,
 					`cached decisions: ${pruner?.cacheSize ?? 0}, requests this session: ${pruner?.requests ?? 0}${pruner?.failures ? `, ${pruner.failures} failed` : ""}${pruner?.windowedRuns ? `, ${pruner.windowedRuns} windowed` : ""}`,
 					...(pruner?.lastError ? [`last error: ${pruner.lastError}`] : []),
 					state.lastStatus ?? "last prune: none",

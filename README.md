@@ -22,30 +22,38 @@ a tool-call/result pairing that would break the provider — the unmodified mess
 
 ## Measured gain
 
-Replayed on two real pi sessions (all messages of the session's compaction-aware context,
-pruned incrementally turn by turn, so decisions accumulate exactly like in a live session):
+Replayed on two real pi sessions, using the default safe rules (results only, calls kept):
 
 | | text/code session | screenshot-heavy session |
 | --- | --- | --- |
 | messages / tool calls | 956 / 480 | 982 / 512 |
-| context before | 578k tok | 879k tok |
-| context after | **369k tok** | **631k tok** |
-| **tokens saved** | **−36 %** | **−28 %** |
-| bytes saved | −39 % | −55 % |
-| Jev requests | 17 | 21 |
+| tool mix | 71 % bash, 21 % write, 6 % edit | 71 % bash, 21 % write, 6 % edit |
+| context before | 578k tok | 916k tok |
+| context after | **514k tok** | **801k tok** |
+| **tokens saved** | **−11 %** | **−12.5 %** |
+| bytes saved | −24 % | −19 % |
+| Jev requests (whole session) | 27 | 34 |
 | failures | 0 | 0 |
+
+For reference, the same replay with whole *calls* also removable (upstream's behaviour) reached
+**−36 %** and **−28 %** of tokens. That extra gain came from deleting 328 and 324 calls, which in
+these sessions included `write`, `edit` and shell commands that launch WSL/PowerShell/Python
+harnesses. Deleting the record of a side effect is how a model ends up repeating work or
+re-running a migration, so this port does not do it by default: a call is only removed when it
+is provably re-runnable (a read-only tool, or a shell command that only reads).
 
 `tools/measure-gain.ts` reproduces this on your own sessions.
 
-Two caveats worth stating plainly:
+Three caveats, stated plainly:
 
-- **Bytes overstate the win when images are involved.** In the screenshot-heavy session 89 %
-  of the bytes were base64 images but only 6 % of the tokens; the byte figure was −55 % while
-  the token figure was −28 %. Tokens are what you pay for.
-- Absolute token counts are estimates (a character model validated to within ~10 % of the
-  usage pi reports). The *ratios* compare the same basis, so they hold; the replay used
-  permissive gates (`minNewCalls: 1`, `minPendingChars: 0`), making these numbers the upper
-  bound — the default configuration prunes slightly less and costs fewer requests.
+- **Bytes overstate the win when images are involved.** In the screenshot-heavy session 88 % of the
+  bytes were base64 images but only 6 % of the tokens.
+- Token counts are estimates (a character model validated to within ~10 % of the usage pi reports),
+  and the replay used permissive gates, so these numbers are an upper bound: the default
+  configuration prunes at most once every `minCallsBetweenPrunes` LLM calls.
+- What cannot be touched at all: thinking blocks (32 % of the text in the first session), user and
+  assistant text. Results, their `details`, the abridged arguments of kept calls, and provably
+  read-only calls are the only movable mass — roughly half the payload.
 
 ## Install
 
@@ -96,8 +104,13 @@ The footer shows a one-line summary when a prune happens:
   "minNewCalls": 2,
   "minPendingChars": 2000,
   "minIntervalMs": 5000,
+  "minCallsBetweenPrunes": 30,
   "fallbackWindowMessages": 120,
   "requestConcurrency": 4,
+  "stateResultHeadChars": 300,
+  "readOnlyTools": ["read", "grep", "find", "ls", "glob"],
+  "detectReadOnlyCommands": true,
+  "abridgeArgumentChars": 500,
   "keepThreshold": 0.5,
   "preserveRecentMessages": 6,
   "maxStateTokens": 25000,
@@ -136,7 +149,14 @@ Cost control — the state is re-sent every request, so a round-trip must be wor
   characters, and when `minIntervalMs` has passed since the last attempt — an attempt is
   recorded even when it fails, so a broken key costs one timeout per interval instead of one
   per request;
-- above 85 % of the window all of that is bypassed (`urgent`).
+- `minCallsBetweenPrunes` (default 30) is the cache-cost gate, and the most important one:
+  removing an old call rewrites the prompt prefix, so the cached suffix becomes a cache
+  **write** instead of a cheap **read** (roughly 10x the price on Anthropic/DeepSeek pricing).
+  A prune that frees a fraction `f` of the context only pays off after about
+  `(write/read − 1) / f ≈ 30` further LLM calls with the shrunken context. Fewer, larger prunes
+  beat continuous trimming;
+- above 85 % of the window all of that is bypassed (`urgent`), because a full window is worse
+  than an invalidation;
 
 ### Why `pi.on("context")` and not `session_before_compact`
 
@@ -148,6 +168,21 @@ function hook — and it keeps the persisted history byte-for-byte intact.
 
 ## Design notes (the non-obvious contracts)
 
+- **A call is only removed when removing it is provably safe.** Whole calls disappear for
+  read-only tools (`readOnlyTools`) and for shell commands that only read (`isReadOnlyCommand`:
+  every `|`/`&&`/`;` segment starts with a read-only command, with no redirect, no command
+  substitution, no background job, no `-i`). Everything else — `write`, `edit`, a `bash` that
+  runs a build, a migration or a WSL/PowerShell harness, any MCP tool — keeps its call: the bulky
+  output is truncated and long arguments are abridged, but the record of *what was run* stays.
+  This is deliberate: a model that cannot see that it already ran the migration will run it again.
+- **Jev sees a head of every result it judges.** Upstream's state replaces each result with
+  `n chars (omitted)`, which asks Jev to judge usefulness from a length. The questions this port
+  builds (`buildQuestions`) append the first `stateResultHeadChars` characters (300) of the result
+  under judgement — never of the whole history, so the state stays small — and batches are priced
+  with those heads included (`batchCallsWith`) to stay under Jev's 32k request limit.
+- **A message carrying a thinking block is never modified.** Some providers sign reasoning
+  payloads; rewriting the message that holds one invalidates it. Such a call is downgraded to a
+  result truncation and its arguments are left alone.
 - **Pairing is the hard invariant.** Providers reject a tool call without its result (and vice
   versa), so `drop_call` always removes the call *and* the result message, and the result is
   re-checked against the set of ids that were paired in the input. If the check fails the
@@ -183,7 +218,7 @@ then reduced to `dist/` + LICENSE + README + package.json, so no toolchain is co
 ```sh
 npm install
 npm run typecheck   # strict TypeScript
-npm test            # 16 behaviour tests, no network
+npm test            # 22 behaviour tests, no network
 npm run check       # both
 npm run vendor      # re-vendor the upstream library
 ```
@@ -198,11 +233,15 @@ node --import jiti/register tools/measure-gain.ts ~/.pi/agent/sessions/<dir>/<se
 
 ## Limits
 
-- Only tool calls and results are candidates. Thinking blocks are the largest single
-  non-prunable block of a context (32 % of the text in one of the measured sessions); text,
-  thinking and images are never removed.
+- Only tool results, their `details`, the abridged arguments of kept calls, and provably
+  re-runnable calls are candidates. Thinking blocks, user text and assistant text are never
+  touched — in a measured session that leaves ~50 % of the payload unreachable.
+- Pruning is therefore **not** a compaction strategy on its own: it keeps a session small, it does
+  not refocus it. pi's own compaction still runs at its threshold, and if you want a model-grown
+  summary of the work, that is still the tool for it.
 - Token sizes are estimated from character counts, not tokenized (images especially: a fixed
   per-image cost). Treat absolute numbers as estimates.
-- A probability is not proof. Jev can be wrong about a result that was still needed; the
-  assistant can always re-run the tool, and `/jev-compaction off` disables everything instantly.
+- A probability is not proof. Jev can be wrong about a result that was still needed; a read-only
+  tool can be re-run, and `/jev-compaction clear` puts the whole history back in front of the
+  model in one command.
 - Requires a Jev API key; without one it does nothing.
