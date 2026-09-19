@@ -4,8 +4,18 @@ import { mkdtempSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import type { JevAsker, JevQuestions, JevResponse, JevState } from "../vendor/fast-jev-compaction/dist/index.js";
-import { JevPruner, configPath, keyFileIsLoose, keyPath, loadConfig, resolveApiKey, type PiMessage } from "../index.ts";
+import type { JevAnswer, JevAsker, JevQuestions, JevResponse, JevState } from "../vendor/fast-jev-compaction/dist/index.js";
+import {
+	JevPruner,
+	configPath,
+	keyFileIsLoose,
+	keyPath,
+	loadConfig,
+	prunerOptions,
+	resolveApiKey,
+	type PiMessage,
+	type PruneOptions,
+} from "../index.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "fast-jev-test-"));
 const ENV_KEYS = ["FAST_JEV_API_KEY", "JEV_API_KEY", "TYPESAFE_API_KEY", "FAST_JEV_CONFIG", "FAST_JEV_KEY_FILE", "FAST_JEV_MIN_NEW_CALLS", "FAST_JEV_ENABLED", "FAST_JEV_TRIGGER_FRACTION"];
@@ -30,6 +40,23 @@ function withEnv(values: Record<string, string | undefined>, body: () => void): 
 class FailingAsker implements JevAsker {
 	async ask(_state: JevState, _questions: JevQuestions): Promise<JevResponse> {
 		throw new Error("HTTP 401: invalid key");
+	}
+}
+
+/** Answers every question from a plan (`"*"` is the fallback), without touching the network. */
+class PlanAsker implements JevAsker {
+	#plan: Record<string, number>;
+
+	constructor(plan: Record<string, number> = {}) {
+		this.#plan = plan;
+	}
+
+	async ask(_state: JevState, questions: JevQuestions): Promise<JevResponse> {
+		const answers: Record<string, JevAnswer> = {};
+		for (const name of Object.keys(questions)) {
+			answers[name] = { type: "noul", noul: this.#plan[name] ?? this.#plan["*"] ?? 1 };
+		}
+		return { answers };
 	}
 }
 
@@ -106,6 +133,80 @@ test("loose key-file permissions are detected where the platform has them", () =
 	chmodSync(path, 0o600);
 	assert.equal(keyFileIsLoose(path), false);
 	assert.equal(keyFileIsLoose(join(dir, "missing-key")), false);
+});
+
+/**
+ * The config file is read by `loadConfig`, but the pruner only sees what `prunerOptions` hands
+ * over. A key dropped on that short path used to be invisible: the values silently fell back to
+ * the pruner defaults while `/jev-compaction` printed the configured ones.
+ */
+test("every config key the pruner reads reaches it", () => {
+	const path = join(dir, "pruner-options.json");
+	writeFileSync(
+		path,
+		JSON.stringify({
+			minPendingChars: 1234,
+			minCallsBetweenPrunes: 7,
+			fallbackWindowMessages: 33,
+			requestConcurrency: 2,
+			stateResultHeadChars: 111,
+			readOnlyTools: ["ffgrep"],
+			detectReadOnlyCommands: false,
+			abridgeArgumentChars: 222,
+		}),
+	);
+	withEnv({}, () => {
+		const options = prunerOptions(loadConfig(path));
+		assert.equal(options.minPendingChars, 1234);
+		assert.equal(options.minCallsBetweenPrunes, 7);
+		assert.equal(options.fallbackWindowMessages, 33);
+		assert.equal(options.requestConcurrency, 2);
+		assert.equal(options.stateResultHeadChars, 111);
+		assert.deepEqual(options.readOnlyTools, ["ffgrep"]);
+		assert.equal(options.detectReadOnlyCommands, false);
+		assert.equal(options.abridgeArgumentChars, 222);
+	});
+});
+
+test("a tool the config lists as read-only is dropped whole, not downgraded", async () => {
+	const path = join(dir, "read-only-tools.json");
+	writeFileSync(
+		path,
+		JSON.stringify({
+			readOnlyTools: ["ffgrep"],
+			preserveRecentMessages: 0,
+			minNewCalls: 1,
+			minIntervalMs: 0,
+			minPendingChars: 0,
+		}),
+	);
+	const messages: PiMessage[] = [
+		{ role: "user", content: "find the callers" },
+		{
+			role: "assistant",
+			content: [{ type: "toolCall", id: "c1", name: "ffgrep", arguments: { pattern: "prunerOptions" } }],
+		},
+		{
+			role: "toolResult",
+			toolCallId: "c1",
+			toolName: "ffgrep",
+			content: [{ type: "text", text: "index.ts:1259: prunerOptions".repeat(200) }],
+			isError: false,
+		},
+		{ role: "user", content: "go on" },
+		{ role: "assistant", content: [{ type: "text", text: "ok" }] },
+	];
+	let options: PruneOptions = {};
+	withEnv({}, () => {
+		options = prunerOptions(loadConfig(path));
+	});
+	const pruner = new JevPruner(new PlanAsker({ "*": 0.1 }), options);
+	const outcome = await pruner.prune(messages, { allowNetwork: true });
+	assert.ok(outcome);
+	assert.equal(outcome.decisions.length, 1);
+	assert.equal(outcome.decisions[0].action, "drop_call", "a configured read-only tool may be removed");
+	assert.equal(outcome.decisions[0].downgraded, undefined, "not downgraded to drop_result");
+	assert.equal(outcome.stats.callsDropped, 1);
 });
 
 test("failures are counted and reported instead of being swallowed", async () => {

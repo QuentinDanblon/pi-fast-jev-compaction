@@ -1242,14 +1242,15 @@ interface PrunerState {
 	restoredDecisions: PersistedDecisions[];
 }
 
-function buildPruner(config: FastJevConfig, apiKey: string): JevPruner {
-	const asker = new HttpJevAsker({
-		apiKey,
-		model: config.model,
-		baseUrl: config.baseUrl,
-		timeoutMs: config.timeoutMs,
-	});
-	return new JevPruner(asker, {
+/**
+ * Every config key the pruner understands, as pruner options.
+ *
+ * Kept separate from `buildPruner` so the config -> pruner wiring is testable: a key missing
+ * here does not fail, it silently falls back to the pruner default, and the config file then
+ * lies about what the extension is doing.
+ */
+export function prunerOptions(config: FastJevConfig): PruneOptions {
+	return {
 		keepThreshold: config.keepThreshold,
 		preserveRecentMessages: config.preserveRecentMessages,
 		maxStateTokens: config.maxStateTokens,
@@ -1257,9 +1258,27 @@ function buildPruner(config: FastJevConfig, apiKey: string): JevPruner {
 		truncateHeadChars: config.truncateHeadChars,
 		triggerFraction: config.triggerFraction,
 		minNewCalls: config.minNewCalls,
+		minPendingChars: config.minPendingChars,
 		minIntervalMs: config.minIntervalMs,
+		minCallsBetweenPrunes: config.minCallsBetweenPrunes,
+		timeoutMs: config.timeoutMs,
+		fallbackWindowMessages: config.fallbackWindowMessages,
+		requestConcurrency: config.requestConcurrency,
+		stateResultHeadChars: config.stateResultHeadChars,
+		readOnlyTools: config.readOnlyTools,
+		detectReadOnlyCommands: config.detectReadOnlyCommands,
+		abridgeArgumentChars: config.abridgeArgumentChars,
+	};
+}
+
+function buildPruner(config: FastJevConfig, apiKey: string): JevPruner {
+	const asker = new HttpJevAsker({
+		apiKey,
+		model: config.model,
+		baseUrl: config.baseUrl,
 		timeoutMs: config.timeoutMs,
 	});
+	return new JevPruner(asker, prunerOptions(config));
 }
 
 function formatStats(outcome: PruneOutcome): string {
